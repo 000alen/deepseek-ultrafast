@@ -53,12 +53,14 @@ pub struct RopeParams {
     pub ratio: i32,
     pub dst: u64,
     pub pos_offset: i32,
+    pub ring_rows: i32,
     pub norm_w: u64,
     pub norm_eps: f32,
     pub dst_by_row: i32,
     pub q4: u64,
     pub sf4: u64,
 }
+const _: () = assert!(size_of::<RopeParams>() == 104 && std::mem::offset_of!(RopeParams, ring_rows) == 68);
 
 #[repr(C)]
 #[derive(Clone, Copy)]

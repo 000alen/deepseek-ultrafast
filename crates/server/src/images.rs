@@ -17,6 +17,15 @@ impl std::fmt::Display for Busy {
 }
 impl std::error::Error for Busy {}
 
+#[derive(Debug)]
+pub(crate) struct ContextCapacity;
+impl std::fmt::Display for ContextCapacity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("expanded image prompt exceeds context capacity")
+    }
+}
+impl std::error::Error for ContextCapacity {}
+
 struct PublicDns;
 impl reqwest::dns::Resolve for PublicDns {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
@@ -145,7 +154,7 @@ fn expand(tok: &Tokenizer, prompt: &str, literal_breaks: &[usize], offsets: &[us
         ensure!(w > 0 && h > 0 && w % 14 == 0 && h % 14 == 0 && (w/14)*(h/14) <= MAX_PATCHES
             && (h/14).div_ceil(3)*(w/14).div_ceil(3) <= 1024, "invalid recipe image grid");
         let len = (h/14).div_ceil(3) * ((w/14).div_ceil(3)+1) + 2;
-        ensure!(tokens.len().checked_add(len).is_some_and(|n| n < max_seq), "expanded image prompt exceeds context capacity");
+        if !tokens.len().checked_add(len).is_some_and(|n| n < max_seq) { return Err(ContextCapacity.into()); }
         let rgb = imgcodecs::imdecode(&Vector::from_slice(&info.data), imgcodecs::IMREAD_COLOR)?;
         ensure!(rgb.cols() == w as i32 && rgb.rows() == h as i32 && rgb.is_continuous(), "resolved image size mismatch");
         let pixels = rgb.data_bytes()?;
@@ -159,7 +168,7 @@ fn expand(tok: &Tokenizer, prompt: &str, literal_breaks: &[usize], offsets: &[us
         tokens.extend(std::iter::repeat_n(IMAGE_TOKEN, len)); at = offset + IMAGE_SPECIAL_TOKEN.len();
     }
     tokens.extend(crate::chat::tokenize_segment(tok, prompt, literal_breaks, at..prompt.len())?);
-    ensure!(tokens.len() < max_seq, "expanded image prompt exceeds context capacity");
+    if tokens.len() >= max_seq { return Err(ContextCapacity.into()); }
     Ok((tokens,items))
 }
 

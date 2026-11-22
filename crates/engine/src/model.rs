@@ -8,6 +8,15 @@ use deepseek_ultrafast_model::config::{Config, rope_table};
 use deepseek_ultrafast_model::packing::sgl_w2_row_bytes;
 
 pub use deepseek_ultrafast_model::limits::{MAX_M, OUT_CAP};
+#[path = "kv_coverage.rs"]
+mod kv_coverage;
+use kv_coverage::{WrittenRows, snapshot_floor};
+#[path = "batch_decode.rs"]
+mod batch_decode;
+pub use batch_decode::{DecodeSlot, DecodeToken, MAX_PACKED_DECODE_CONTEXT, MAX_PACKED_DECODE_WIDTH, PagedKvLayout};
+#[path = "batch_speculation.rs"]
+mod batch_speculation;
+pub use batch_speculation::SpecDecoded;
 const MOE_PLAN_SLOTS: usize = 97;
 
 pub const PMAX: usize = 8192;
@@ -262,7 +271,9 @@ struct AttnFParams {
     nh: i32,
     pre: i32,
     win_floor: i32,
+    ring_rows: i32,
 }
+const _: () = assert!(size_of::<AttnFParams>() == 96 && std::mem::offset_of!(AttnFParams, ring_rows) == 92);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -341,6 +352,14 @@ fn shard_rows(rank: usize, m: usize, tp: usize) -> (usize, usize) {
 
 pub struct LayerCache {
     pub win: DevPtr,
+    /// Physical SWA rows. Zero selects dense addressing.
+    pub ring_rows: usize,
+    pub hist_rows: usize,
+    on_wire: bool,
+    compress_ratio: usize,
+    compact_live: std::cell::Cell<usize>,
+    window_live: std::cell::Cell<WrittenRows>,
+    history_live: std::cell::Cell<WrittenRows>,
     pub comp: Option<DevPtr>,
     pub idx_k: Option<DevPtr>,
     pub idx_k4: Option<(DevPtr, DevPtr)>,
@@ -515,6 +534,7 @@ pub struct Rank {
     pub caches: Vec<LayerCache>,
     pub mtp_caches: Vec<LayerCache>,
     pub cmp_hist: DevPtr,
+    window_scratch: (DevPtr, usize),
     rope_base: (DevPtr, DevPtr),
     rope_comp: (DevPtr, DevPtr),
     pub engram: EngramTables,
@@ -575,6 +595,11 @@ pub struct Rank {
     conf_buf: DevPtr,
     samp: (DevPtr, DevPtr, DevPtr, DevPtr, DevPtr, DevPtr),
     samp_rec: DevPtr,
+    packed_rows: DevPtr,
+    packed_target_rows: usize,
+    packed_graphs_enabled: bool,
+    packed_graphs: std::collections::HashMap<(usize, bool), Option<cu::GraphExec>>,
+    packed_spec: Option<batch_speculation::Workspace>,
     mk_kmax: DevPtr,
     mk_grid: std::cell::Cell<usize>,
     blk: usize,
@@ -599,6 +624,33 @@ struct TailBufs {
     h: DevPtr,
     pre: DevPtr,
     state: std::cell::Cell<EncoderTail>,
+    raw_floor: std::cell::Cell<usize>,
+    mapped_tokens: usize,
+    generation: u64,
+}
+
+impl TailBufs {
+    fn renew_lease(&mut self) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        self.generation = NEXT.fetch_add(1, Ordering::Relaxed);
+    }
+
+
+}
+
+/// Cursor for one CED prefill. Resume with the same prompt and sequence state.
+pub struct PrefillProgress {
+    pos: usize,
+    end: usize,
+    decoder_start: usize,
+    short_append: bool,
+}
+
+impl PrefillProgress {
+    pub fn remaining(&self) -> usize {
+        self.end - self.pos
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -657,15 +709,56 @@ impl Rank {
         tp: usize,
         cfg: Config,
         dev: cu::Device,
+        w: Weights,
+        arena: Arena,
+        max_seq: usize,
+        pmax: usize,
+        engram: EngramTables,
+    ) -> Result<Self> {
+        Self::new_inner(rank, tp, cfg, dev, w, arena, max_seq, pmax, engram, false)
+    }
+
+    /// Keep rank-wide weights and workspaces, and leave sequence cache storage to DecodeSlot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_packed(
+        rank: usize,
+        tp: usize,
+        cfg: Config,
+        dev: cu::Device,
+        w: Weights,
+        arena: Arena,
+        max_seq: usize,
+        pmax: usize,
+        engram: EngramTables,
+    ) -> Result<Self> {
+        ensure!((1..=MAX_PACKED_DECODE_CONTEXT).contains(&max_seq), "invalid packed context capacity");
+        Self::new_inner(rank, tp, cfg, dev, w, arena, max_seq, pmax, engram, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_inner(
+        rank: usize,
+        tp: usize,
+        cfg: Config,
+        dev: cu::Device,
         mut w: Weights,
         mut arena: Arena,
         max_seq: usize,
         pmax: usize,
         engram: EngramTables,
+        packed: bool,
     ) -> Result<Self> {
         let c = &cfg;
         let k = Kernels::load()?;
-        let pmax = prefill_capacity(pmax, c.window_size);
+        let pmax = prefill_capacity(if packed { pmax.max(MAX_PACKED_DECODE_WIDTH) } else { pmax }, c.window_size);
+        let head_rows = if packed { MAX_PACKED_DECODE_WIDTH } else { MAX_M };
+        let packed_graphs_enabled = if packed {
+            match std::env::var("DSUF_PACKED_GRAPHS").as_deref() {
+                Ok("0") => false,
+                Ok("1") | Err(std::env::VarError::NotPresent) => true,
+                _ => anyhow::bail!("DSUF_PACKED_GRAPHS must be 0 or 1"),
+            }
+        } else { false };
         let (plo, phi) = Stream::priority_range()?;
         let (pmain, pside, ppar) = match deepseek_ultrafast_cuda::profile::profile() {
             deepseek_ultrafast_cuda::profile::Profile::Sm103Tp4 => (-4, -4, -5),
@@ -679,21 +772,9 @@ impl Rank {
         let a = &mut arena;
         let f32b = 4usize;
         let bf = 2usize;
-        let mut caches = Vec::new();
-        for l in 0..c.n_layers + c.n_mtp_layers {
-            let ratio = c.compress_ratios[l];
-            let src = c.is_kv_source(l);
-            caches.push(LayerCache {
-                win: a.zeroed(max_seq * hd * bf)?,
-                comp: if src { Some(a.zeroed(max_seq / ratio * hd * bf)?) } else { None },
-                idx_k: if src { Some(a.zeroed(max_seq / ratio * c.index_head_dim * bf)?) } else { None },
-                idx_k4: if src { Some((a.zeroed(max_seq / ratio * 64)?, a.zeroed((max_seq / ratio).div_ceil(128) * 512)?)) } else { None },
-                kv_hist: if src && ratio > 1 { Some(a.zeroed(max_seq * hd * f32b)?) } else { None },
-                sc_hist: if src && ratio > 1 { Some(a.zeroed(max_seq * hd * f32b)?) } else { None },
-            });
-        }
-        let mtp_caches = caches.split_off(c.n_layers);
-        let cmp_hist = a.zeroed(max_seq * 4)?;
+        // Keep the logical shape for host snapshots. Packed forwards bind a DecodeSlot before using it.
+        let (caches, mtp_caches) = batch_decode::allocate_layer_caches(c, max_seq, |bytes| if packed { Ok(0) } else { a.zeroed(bytes) })?;
+        let cmp_hist = if packed { 0 } else { a.zeroed(max_seq * 4)? };
         let rd = c.rope_head_dim;
         let (cb, sb) = rope_table(rd, max_seq, 0, c.rope_theta, c.rope_factor, c.beta_fast, c.beta_slow);
         let (cc, scomp) = rope_table(rd, max_seq, c.original_seq_len, c.compress_rope_theta, c.rope_factor, c.beta_fast, c.beta_slow);
@@ -706,7 +787,14 @@ impl Rank {
         let dspark_blk = c.dspark_block_size;
         let conf_buf = a.zeroed(256)?;
         let samp = (a.zeroed(64)?, a.zeroed(64)?, a.zeroed(8 * 200 * 4)?, a.zeroed(8 * w.head.n * 4)?, a.zeroed(8 * 1024 * 8)?, a.zeroed(64)?);
-        let samp_rec = a.zeroed(8 * (w.head.n / 64) * 20 * 4)?;
+        let samp_rec = a.zeroed((if packed { head_rows } else { 8 }) * (w.head.n / 64) * 20 * 4)?;
+        let packed_rows = if packed { a.alloc(head_rows * size_of::<batch_decode::DeviceRow>())? } else { 0 };
+        let window_scratch = if packed {
+            let rows = max_seq.min(pmax + c.window_size.saturating_sub(1));
+            (a.alloc(rows * hd * bf)?, rows)
+        } else {
+            (0, 0)
+        };
         let spec_snap_buf = a.zeroed(32)?;
         let ne = c.engram_layer_ids.len();
         let ev_ejoin: Vec<cu::Event> = (0..ne).map(|_| cu::Event::new()).collect::<Result<_>>()?;
@@ -829,7 +917,7 @@ impl Rank {
             ex: a.zeroed(m * 24 * 256 * bf)?,
             ekv_part: a.zeroed(m * 5 * dim / tp * f32b)?,
             ekv: a.zeroed(m * 5 * dim * bf)?,
-            logits: a.zeroed(MAX_M * w.head.n * f32b)?,
+            logits: a.zeroed(head_rows * w.head.n * f32b)?,
             amax_v: a.zeroed(m * f32b)?,
             amax_i: a.zeroed(m * 4)?,
             amax_pack: a.zeroed(m * 4 * f32b)?,
@@ -925,7 +1013,15 @@ impl Rank {
             }
         }
         stream.synchronize()?;
-        let tail = TailBufs { h: a.zeroed(c.window_size * 4 * dim * bf)?, pre: a.zeroed(c.window_size * 4 * f32b)?, state: std::cell::Cell::new(EncoderTail::default()) };
+        let mut tail = TailBufs {
+            h: a.zeroed(c.window_size * 4 * dim * bf)?,
+            pre: a.zeroed(c.window_size * 4 * f32b)?,
+            state: Default::default(),
+            raw_floor: Default::default(),
+            mapped_tokens: if packed { 0 } else { max_seq },
+            generation: 0,
+        };
+        tail.renew_lease();
         let tcw13 = Self::tcw13_init(&k, &w, a, dim)?;
         let sgl = Self::sgl_init(&w, a, dim, cfg.swiglu_limit)?;
         let tg2 = if ops::tcgemv2_on() {
@@ -983,6 +1079,7 @@ impl Rank {
             caches,
             mtp_caches,
             cmp_hist,
+            window_scratch,
             rope_base,
             rope_comp,
             engram,
@@ -1042,6 +1139,11 @@ impl Rank {
             conf_buf,
             samp,
             samp_rec,
+            packed_rows,
+            packed_target_rows: if packed { 8 } else { 0 },
+            packed_graphs_enabled,
+            packed_graphs: Default::default(),
+            packed_spec: None,
             mk_kmax,
             mk_grid: std::cell::Cell::new(0),
             blk: dspark_blk,
@@ -1063,7 +1165,7 @@ impl Rank {
             tg2,
             woa64,
         };
-        rk.index_tmaps()?;
+        if !packed { rk.index_tmaps()?; }
         Ok(rk)
     }
 
@@ -2088,6 +2190,7 @@ impl Rank {
             ratio: ratio as i32,
             dst,
             pos_offset: 0,
+            ring_rows: 0,
             norm_w,
             norm_eps: self.cfg.norm_eps,
             dst_by_row: 0,
@@ -2207,7 +2310,13 @@ impl Rank {
     }
 
     fn stream_kv_source(&self, l: usize, m: usize) -> Result<()> {
-        self.attn_side(l, m)
+        let start = self.host_pos_end - m;
+        if self.packed_rows != 0 {
+            self.caches[l].check_history(start, self.host_pos_end)?;
+        }
+        self.attn_side(l, m)?;
+        if self.packed_rows != 0 { self.caches[l].record_history(start, self.host_pos_end); }
+        Ok(())
     }
 
     fn stash_tail(&mut self, m: usize) -> Result<()> {
@@ -2230,6 +2339,13 @@ impl Rank {
     pub(crate) fn encoder_tail_state(&self) -> EncoderTail { self.tail.state.get() }
 
     pub(crate) fn restore_encoder_tail_state(&self, state: EncoderTail) { self.tail.state.set(state); }
+
+    pub(crate) fn kv_lease(&self) -> (DevPtr, u64) { (self.cmp_hist, self.tail.generation) }
+
+    pub(crate) fn check_kv_mapping(&self, through: usize) -> Result<()> {
+        ensure!(self.cmp_hist != 0 && through <= self.tail.mapped_tokens, "KV access exceeds the bound slot's mapped token range");
+        Ok(())
+    }
 
     pub(crate) fn encoder_tail_segments(&self) -> [(DevPtr, usize); 2] {
         [(self.tail.h, self.cfg.window_size * 4 * self.cfg.dim * 2), (self.tail.pre, self.cfg.window_size * 4 * 4)]
@@ -2277,14 +2393,128 @@ impl Rank {
     }
 
     pub fn prefill(&mut self, toks: &[i32], from: usize, chunk: usize) -> Result<i32> {
-        self.short_append = (short_append_eligible(self.tail.state.get(), from, toks.len(), self.cfg.window_size, self.short_ready)
-            || short_cold_eligible(from, toks.len()))
-            && self.vision.as_ref().is_none_or(|v| !v.overlaps(from, toks.len().saturating_sub(from)));
+        self.check_prefill_input(toks, from)?;
+        self.check_prefill_chunk(chunk)?;
+        let mut progress = self.begin_prefill_checked(toks, from)?;
+        while progress.remaining() != 0 {
+            self.prefill_chunk(toks, &mut progress, chunk)?;
+        }
+        self.finish_prefill(toks, progress)
+    }
+
+    fn check_prefill_input(&self, toks: &[i32], from: usize) -> Result<()> {
+        ensure!(self.cmp_hist != 0, "packed prefill requires a bound decode slot");
+        ensure!(from < toks.len() && toks.len() <= self.max_seq, "prefill requires from < tokens.len() <= max_seq");
+        Ok(())
+    }
+
+    fn check_prefill_chunk(&self, chunk: usize) -> Result<()> {
+        ensure!(chunk > 0 && chunk <= self.pmax, "prefill chunk must be in 1..={} (this rank's buffers)", self.pmax);
+        Ok(())
+    }
+
+    /// Initialize the encoder cursor after prefix restore and image staging.
+    /// This may enqueue a bounded, read-only reconstruction of the encoder tail.
+    pub fn begin_prefill(&mut self, toks: &[i32], from: usize) -> Result<PrefillProgress> {
+        self.check_prefill_input(toks, from)?;
+        self.begin_prefill_checked(toks, from)
+    }
+
+    fn begin_prefill_checked(&mut self, toks: &[i32], from: usize) -> Result<PrefillProgress> {
+        self.tail.renew_lease();
+        if self.packed_rows != 0 {
+            for cache in self.caches.iter().chain(&self.mtp_caches) {
+                cache.truncate(from);
+                // CED rebuilds these windows with a new replay boundary; older
+                // decoder and draft rows are not valid on the new branch.
+                if !cache.on_wire { cache.window_live.set(WrittenRows::default()); }
+            }
+        }
+        if from == 0 {
+            self.tail.raw_floor.set(0);
+        }
+        let n = toks.len();
+        let dec0 = self.cfg.n_layers / 2;
+        let window = self.cfg.window_size;
+        ensure!(dec0 > 0 && window == 128
+            && self.cfg.kv_source_layers.iter().copied().max() == Some(dec0)
+            && self.cfg.compress_ratios[dec0] == 1
+            && self.cfg.engram_layer_ids.iter().all(|&l| l < dec0)
+            && self.cfg.dspark_target_layer_ids.iter().all(|&l| l >= dec0),
+            "CED requires the V4.1 encoder/decoder KV-source layout and a 128-token window");
+        let tail = self.tail.state.get();
+        let short_append = (short_append_eligible(tail, from, n, window, self.short_ready)
+            || short_cold_eligible(from, n))
+            && self.vision.as_ref().is_none_or(|v| !v.overlaps(from, n - from));
+        let s = n.saturating_sub(window);
+        let kept = tail.retain(s, from, window);
+        self.tail.state.set(kept.unwrap_or_default());
+        if s < from && kept.is_none() {
+            self.with_prefill(short_append, |rk| {
+                rk.swa_replay.set(true);
+                rk.encoder_readonly.set(true);
+                let result = (|| {
+                    rk.set_prefill(s, &toks[s..from])?;
+                    rk.forward_impl(from - s, 0, dec0, true, false, None, None)?;
+                    rk.stash_tail(from - s)
+                })();
+                rk.swa_replay.set(false);
+                rk.encoder_readonly.set(false);
+                result
+            })?;
+        }
+        self.end_prefill();
+        Ok(PrefillProgress { pos: from, end: n, decoder_start: dec0, short_append })
+    }
+
+    /// Enqueue up to `chunk` new encoder rows. The sequence's GPU buffers must
+    /// remain valid until the stream has completed this work.
+    pub fn prefill_chunk(&mut self, toks: &[i32], progress: &mut PrefillProgress, chunk: usize) -> Result<usize> {
+        ensure!(self.cmp_hist != 0, "packed prefill requires a bound decode slot");
+        ensure!(toks.len() == progress.end, "prefill prompt length changed");
+        self.check_prefill_chunk(chunk)?;
+        let m = progress.remaining().min(chunk);
+        if m == 0 {
+            return Ok(0);
+        }
+        let pos = progress.pos;
+        let tokens = &toks[pos..pos + m];
+        self.with_prefill(progress.short_append, |rk| {
+            if m > MAX_M {
+                rk.set_prefill(pos, tokens)?;
+            } else {
+                let mut meta = Meta { pos: pos as i32, m: m as i32, tokens: [0; 16] };
+                meta.tokens[..m].copy_from_slice(tokens);
+                rk.set_meta(&meta)?;
+            }
+            rk.forward_impl(m, 0, progress.decoder_start, true, false, None, None)?;
+            rk.stream_kv_source(progress.decoder_start, m)?;
+            rk.stash_tail(m)
+        })?;
+        progress.pos += m;
+        self.end_prefill();
+        Ok(m)
+    }
+
+    /// Rebuild the bounded decoder window and sample the first output token.
+    pub fn finish_prefill(&mut self, toks: &[i32], progress: PrefillProgress) -> Result<i32> {
+        ensure!(self.cmp_hist != 0, "packed prefill replay requires a bound decode slot");
+        ensure!(toks.len() == progress.end, "prefill prompt length changed");
+        ensure!(progress.remaining() == 0, "prefill has unfinished encoder rows");
+        let tok = self.with_prefill(progress.short_append, |rk| rk.replay_decoder(toks))?;
+        self.end_prefill();
+        if toks.len() >= self.cfg.window_size {
+            self.short_ready = true;
+        }
+        Ok(tok)
+    }
+
+    fn with_prefill<T>(&mut self, short_append: bool, run: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        self.short_append = short_append;
         self.image_prefill = true;
-        let result = self.prefill_inner(toks, from, chunk);
+        let result = run(self);
         self.image_prefill = false;
         self.short_append = false;
-        if result.is_ok() && toks.len() >= self.cfg.window_size { self.short_ready = true; }
         result
     }
 
@@ -2297,54 +2527,51 @@ impl Rank {
         }
     }
 
-    fn image_rows(&self, m: usize) -> bool {
-        self.image_prefill && self.vision.as_ref().is_some_and(|v| v.overlaps(self.host_pos_end.saturating_sub(m), m))
+    /// Build routing spans and select the images needed by new encoder rows or replay.
+    pub fn begin_image_staging(
+        &mut self,
+        images: &[deepseek_ultrafast_model::vision::Image],
+        toks: &[i32],
+        from: usize,
+    ) -> Result<crate::vision::StagedImages> {
+        if self.vision.is_some() {
+            crate::vision::Vision::begin_staging(images, toks, from, self.cfg.window_size)
+        } else {
+            ensure!(images.is_empty(), "vision weights were not loaded");
+            Ok(crate::vision::StagedImages::default())
+        }
     }
 
-    fn prefill_inner(&mut self, toks: &[i32], from: usize, chunk: usize) -> Result<i32> {
-        let n = toks.len();
-        ensure!(from < n && n <= self.max_seq, "prefill requires from < tokens.len() <= max_seq");
-        ensure!(chunk > 0 && chunk <= self.pmax, "prefill chunk must be in 1..={} (this rank's buffers)", self.pmax);
-        let dec0 = self.cfg.n_layers / 2;
-        ensure!(dec0 > 0 && self.cfg.window_size == 128
-            && self.cfg.kv_source_layers.iter().copied().max() == Some(dec0)
-            && self.cfg.compress_ratios[dec0] == 1
-            && self.cfg.engram_layer_ids.iter().all(|&l| l < dec0)
-            && self.cfg.dspark_target_layer_ids.iter().all(|&l| l >= dec0),
-            "CED requires the V4.1 encoder/decoder KV-source layout and a 128-token window");
-        let s = n.saturating_sub(self.cfg.window_size);
-        let kept = self.tail.state.get().retain(s, from, self.cfg.window_size);
-        self.tail.state.set(kept.unwrap_or_default());
-        if s < from && kept.is_none() {
-            self.swa_replay.set(true);
-            self.encoder_readonly.set(true);
-            let r = (|| -> Result<()> {
-                self.set_prefill(s, &toks[s..from])?;
-                self.forward_impl(from - s, 0, dec0, true, false, None, None)?;
-                self.stash_tail(from - s)
-            })();
-            self.swa_replay.set(false);
-            self.encoder_readonly.set(false);
-            r?;
+    /// Encode one image on this rank's stream and report when the stage is ready.
+    pub fn stage_next_image(&mut self, staged: &mut crate::vision::StagedImages) -> Result<bool> {
+        if let Some(vision) = &mut self.vision {
+            vision.stage_next(&self.k, &self.stream, staged)
+        } else {
+            ensure!(staged.is_complete(), "vision weights were not loaded");
+            Ok(true)
         }
-        let mut pos = from;
-        while pos < n {
-            let m = (n - pos).min(chunk);
-            if m > MAX_M {
-                self.set_prefill(pos, &toks[pos..pos + m])?;
-            } else {
-                let mut meta = Meta { pos: pos as i32, m: m as i32, tokens: [0; 16] };
-                meta.tokens[..m].copy_from_slice(&toks[pos..pos + m]);
-                self.set_meta(&meta)?;
-            }
-            self.forward_impl(m, 0, dec0, true, false, None, None)?;
-            self.stream_kv_source(dec0, m)?;
-            self.stash_tail(m)?;
-            pos += m;
+    }
+
+    /// Bind one sequence's image embeddings and routing data for a prefill step.
+    /// The caller must retain the backing stage through its last GPU reader.
+    pub fn with_staged_images<T>(
+        &mut self,
+        images: &mut crate::vision::StagedImages,
+        run: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        ensure!(images.is_complete(), "vision stage is incomplete");
+        if let Some(vision) = &mut self.vision {
+            vision.swap_staged(images);
         }
-        let tok = self.replay_decoder(toks)?;
-        self.end_prefill();
-        Ok(tok)
+        let result = run(self);
+        if let Some(vision) = &mut self.vision {
+            vision.swap_staged(images);
+        }
+        result
+    }
+
+    fn image_rows(&self, m: usize) -> bool {
+        self.image_prefill && self.vision.as_ref().is_some_and(|v| v.overlaps(self.host_pos_end.saturating_sub(m), m))
     }
 
     fn sub16<F: FnMut(&mut Self, usize, usize) -> Result<()>>(&mut self, m: usize, mut f: F) -> Result<()> {
@@ -2419,6 +2646,8 @@ impl Rank {
     }
 
     pub fn read_logits(&self, m: usize) -> Result<Vec<f32>> {
+        let capacity = MAX_M.max(self.packed_decode_capacity());
+        ensure!(m <= capacity, "logit read of {m} rows exceeds the allocated {capacity}");
         self.stream.synchronize()?;
         let (v, ld) = (self.cfg.vocab_size / self.tp, self.w.head.n);
         let all: Vec<f32> = cu::download(self.b.logits, m * ld)?;
@@ -2442,6 +2671,7 @@ impl Rank {
     }
 
     pub fn forward(&mut self, m: usize, n_layers: usize, mut trace: Option<&mut Vec<Vec<u16>>>) -> Result<()> {
+        ensure!(self.cmp_hist != 0, "packed forward requires bound sequence state");
         self.moe_rows_ok(m)?;
         self.forward_impl(m, 0, n_layers, true, true, trace.as_deref_mut(), None)
     }
@@ -2476,6 +2706,18 @@ impl Rank {
     ) -> Result<()> {
         let c = self.cfg.clone();
         let dim = c.dim;
+        let start = self.host_pos_end.saturating_sub(m);
+        let read = start.saturating_sub(c.window_size - 1).max(self.win_floor.get() as usize);
+        let readonly = self.encoder_readonly.get();
+        let history_write = !self.swa_replay.get() && !readonly;
+        if self.packed_rows != 0 {
+            ensure!(m <= self.host_pos_end && lo < hi && hi <= self.caches.len(), "invalid packed forward range");
+            self.check_kv_mapping(self.host_pos_end)?;
+            for l in lo..hi {
+                self.caches[l].check_window(read, if readonly { self.host_pos_end } else { start })?;
+                if history_write { self.caches[l].check_history(start, self.host_pos_end)?; }
+            }
+        }
         self.hcur = 0;
         let hist = if self.encoder_readonly.get() { 0 } else { self.cmp_hist };
         let fused = embed && lo == 0 && !(m > MAX_M && self.meta == self.metas) && !self.image_rows(m) && self.embed_prep(m, self.w.layers[lo].hc_attn.0, hist)?;
@@ -2504,8 +2746,16 @@ impl Rank {
                     self.hc_prep(m, self.epi(self.w.layers[l].hc_attn.0, false))?;
                 }
             }
-            let r = self.layer(l, m);
-            r?;
+            if self.packed_rows == 0 {
+                self.layer(l, m)?;
+            } else {
+                if let Err(error) = self.layer_with_window_scratch(l, m, read) {
+                    if !readonly { self.caches[l].truncate(0); }
+                    return Err(error);
+                }
+                if !readonly { self.caches[l].record_window(start, self.host_pos_end); }
+                if history_write { self.caches[l].record_history(start, self.host_pos_end); }
+            }
             if l + 1 == hi && self.cand_pending.replace(false) {
                 self.par_join()?;
             }
@@ -2559,10 +2809,8 @@ impl Rank {
         self.pick_head(m, srec.is_some())
     }
 
-    fn pick_head(&mut self, m: usize, records: bool) -> Result<()> {
+    fn head_sampling_io(&self, records: bool) -> SampIo {
         let (vloc, vpad) = (self.cfg.vocab_size / self.tp, self.w.head.n);
-
-        ensure!(m <= 8 || !self.spec_prep_par.get(), "sampling verify head: at most 8 rows");
         let mut q = SampIo {
             logits: self.b.logits,
             vloc: vloc as i32,
@@ -2594,6 +2842,12 @@ impl Rank {
         for (r, pb) in self.peers.iter().enumerate() {
             q.recv[r] = *pb + off;
         }
+        q
+    }
+
+    fn pick_head(&mut self, m: usize, records: bool) -> Result<()> {
+        ensure!(m <= 8 || !self.spec_prep_par.get(), "sampling verify head: at most 8 rows");
+        let q = self.head_sampling_io(records);
         self.prep_gather_pending.set(false);
         let sc = if q.block != 0 && q.last_only == 0 && ops::variant_cc() { 4 } else { 1 };
         let mut cfg = Launch::new((m * sc) as u32, 1024);
@@ -2603,7 +2857,64 @@ impl Rank {
         return self.launch(if sc > 1 { "variant_zzzzzzzsamp/samp_stats" } else { "samp_stats" }, cfg, Args::new().ptr(self.meta).push(q));
     }
 
+    fn copy_window_rows(
+        &self,
+        rows: std::ops::Range<usize>,
+        src: (DevPtr, usize),
+        dst: (DevPtr, usize),
+    ) -> Result<()> {
+        ensure!(rows.len() <= src.1.min(dst.1), "window copy exceeds retained rows");
+        let row_bytes = self.cfg.head_dim * 2;
+        for (from, to, count) in window_copy_runs(rows, src.1, dst.1) {
+            cu::memcpy_dtod_async(
+                dst.0 + (to * row_bytes) as u64,
+                src.0 + (from * row_bytes) as u64,
+                count * row_bytes,
+                &self.stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    // A full forward can write a large chunk before attention reads its earliest
+    // query. Stage this layer's window while preserving the original GEMV batch.
+    fn layer_with_window_scratch(&mut self, l: usize, m: usize, first_read: usize) -> Result<()> {
+        let live = (self.caches[l].win, self.caches[l].ring_rows);
+        if live.1 == 0 {
+            return self.layer(l, m);
+        }
+        let end = self.host_pos_end;
+        let start = end.checked_sub(m).ok_or_else(|| anyhow::anyhow!("invalid window write range"))?;
+        ensure!(first_read <= start, "invalid window read range");
+        if end - first_read <= live.1 {
+            return self.layer(l, m);
+        }
+        self.check_kv_mapping(end)?;
+        let scratch = self.window_scratch;
+        ensure!(scratch.0 != 0 && end - first_read <= scratch.1, "forward exceeds rank window scratch");
+        ensure!(!self.encoder_readonly.get(), "read-only replay exceeds retained window rows");
+        self.copy_window_rows(first_read..start, live, scratch)?;
+        self.caches[l].win = scratch.0;
+        self.caches[l].ring_rows = scratch.1;
+        let result = self.layer(l, m);
+        self.caches[l].win = live.0;
+        self.caches[l].ring_rows = live.1;
+        if let Err(error) = result {
+            // A failed layer can leave a parallel RoPE write outstanding.
+            self.dev.synchronize()?;
+            return Err(error);
+        }
+        // The attention launch on the main stream joins the parallel RoPE writer.
+        self.copy_window_rows(start.max(end.saturating_sub(live.1))..end, scratch, live)
+    }
+
     fn layer(&mut self, l: usize, m: usize) -> Result<()> {
+        self.attention_layer(l, m, true)?;
+        self.attention_output(l, m)?;
+        self.ffn_layer(l, m)
+    }
+
+    fn attention_layer(&mut self, l: usize, m: usize, draft_hidden: bool) -> Result<()> {
         self.cur_layer.set(l);
         let c = self.cfg.clone();
         let dim = c.dim;
@@ -2617,7 +2928,7 @@ impl Rank {
         if ly.engram.is_some() {
             self.engram_block(l, m)?;
         }
-        if let Some(t) = c.dspark_target_layer_ids.iter().position(|&x| x == l) {
+        if draft_hidden && let Some(t) = c.dspark_target_layer_ids.iter().position(|&x| x == l) {
             let mean_side = m <= MAX_M && deepseek_ultrafast_cuda::profile::sm103();
             let margs = || {
                 let mut a = Args::new();
@@ -2671,10 +2982,13 @@ impl Rank {
             self.ev_ixj.record(&self.ixs)?;
         }
         let cache_win = if self.encoder_readonly.get() { 0 } else { self.caches[l].win };
-        let kvp = self.rope_params(self.b.kv, hd, hd, 1, table, false, Q_FP8, 0, cache_win, ly.kv_norm);
+        let kvp = RopeParams {
+            ring_rows: self.caches[l].ring_rows as i32,
+            ..self.rope_params(self.b.kv, hd, hd, 1, table, false, Q_FP8, 0, cache_win, ly.kv_norm)
+        };
         if par && !kv_wqb {
             self.par_fork()?;
-            self.on_par(|me| me.rope_n(me.b.kv, hd, hd, 1, m, table, false, Q_FP8, 0, cache_win, ly.kv_norm))?;
+            self.on_par(|me| me.rope_launch(kvp, m))?;
         }
         let qnorm = Some((ly.q_norm, c.norm_eps));
         let fuse_rope = (par || kv_wqb) && m <= MAX_M;
@@ -2940,6 +3254,7 @@ impl Rank {
                 nh: (c.n_heads / self.tp) as i32,
                 pre: 1 | if ratio > 0 && ly.indexer.is_none() { 2 } else { 0 },
                 win_floor: self.win_floor.get(),
+                ring_rows: self.caches[l].ring_rows as i32,
             };
             let hgroups = heads.div_ceil(16) as u32;
             let fused = if hgroups > 1 { "attn_fused_hg" } else { "attn_fused" };
@@ -2964,7 +3279,16 @@ impl Rank {
                 self.launch(af, cfg, Args::new().ptr(self.meta).push(p))?;
             }
         }
-        self.hc_late_fork()?;
+        self.hc_late_fork()
+    }
+
+    fn attention_output(&mut self, l: usize, m: usize) -> Result<()> {
+        let c = &self.cfg;
+        let dim = c.dim;
+        let hd = c.head_dim;
+        let tp = self.tp;
+        let heads = c.n_heads / tp;
+        let ly = &self.w.layers[l];
         let gl = c.o_groups / tp * c.o_lora_rank;
         let ob16 = m > MAX_M && self.tp > 1;
         let src16 = if ob16 { CM_SRC16 } else { 0 };
@@ -2984,20 +3308,21 @@ impl Rank {
             self.gemv(&ly.wo_b, self.b.oa, gl, m, self.b.ob, dim, GemvOpts { out_f32: !ob16, xshift: 4, ..Default::default() })?;
             (self.b.ob, 1)
         };
-        let (hin, hout) = (self.b.h[self.hcur], self.b.h[1 - self.hcur]);
         self.hc_join()?;
-        let _ = (hin, hout);
         let (hin, hout) = (self.b.h[self.hcur], self.b.h[1 - self.hcur]);
         self.comm_ex(ob, dim, dim, CM_SUM_HCPOST | src16, true, hout, dim, false, Some((hin, self.b.post_a, self.b.comb_a)), ob_ns, 0, Some(self.epi_nodots()))?;
         self.hcur = 1 - self.hcur;
+        Ok(())
+    }
 
+    fn ffn_layer(&mut self, l: usize, m: usize) -> Result<()> {
         let ly: &Layer = &self.w.layers[l];
         let side_in = self.ffn_dots_in(ly, m) && !self.image_rows(m) && !(m > MAX_M && self.pm.is_some());
         if !side_in {
             self.hc_fork_dots(ly.hc_ffn, true, "ffn")?;
         }
         let lyp = ly as *const Layer;
-        let topk = c.n_activated_experts;
+        let topk = self.cfg.n_activated_experts;
         let h0 = self.hcur;
         let rm_mid = ly.experts.rm && m <= MAX_M && !self.ffn_gate_in(ly, m);
         ensure!(!rm_mid || self.image_prefill || m <= 8, "tmoe: decode steps of more than 8 rows (draft block > 7) are not supported");
@@ -3097,7 +3422,7 @@ impl Rank {
             .f32(c.route_scale).ptr(self.b.route_ids).ptr(self.b.route_w);
         let kernel = if self.image_rows(m) {
             let v = self.vision.as_ref().unwrap();
-            route.ptr(v.biases[ly.id].ptr).ptr(v.spans_ptr()).i32(v.span_count as i32).i32((self.host_pos_end - m) as i32);
+            route.ptr(v.biases[ly.id].ptr).ptr(v.spans_ptr()).i32(v.span_count() as i32).i32((self.host_pos_end - m) as i32);
             "vision_route"
         } else { "moe_route_tokens" };
         self.launch(kernel, Launch::new((m as u32).div_ceil(8), 256), &mut route)?;
@@ -3173,7 +3498,7 @@ impl Rank {
         Ok(())
     }
 
-    fn engram_pre(&self, l: usize, m: usize, bufs: (DevPtr, DevPtr, DevPtr, DevPtr)) -> Result<()> {
+    fn engram_pre(&self, l: usize, m: usize, bufs: (DevPtr, DevPtr, DevPtr, DevPtr), packed: bool) -> Result<()> {
         let c = &self.cfg;
         let dim = c.dim;
         let ly: &Layer = &self.w.layers[l];
@@ -3193,10 +3518,10 @@ impl Rank {
         let ehd = c.engram_head_dim;
         let (b_eg, b_ex, b_part, b_ekv) = bufs;
         self.launch(
-            "engram_gather",
+            if packed { "engram_gather_packed" } else { "engram_gather" },
             grid(cols as u32, m as u32, 64),
             Args::new()
-                .ptr(self.meta)
+                .ptr(if packed { self.packed_rows } else { self.meta })
                 .ptr(self.cmp_hist)
                 .push(hp)
                 .ptr(eg.table)
@@ -3305,7 +3630,7 @@ impl Rank {
                 ensure!(dim <= 20 * 256, "engram_apply_peer: dim <= 5120");
                 self.launch("engram_apply_peer", grid(4, m as u32, 256), Args::new().ptr(self.meta).ptr(self.cmp_hist).ptr(self.hbuf()).push(q).ptr(eg.qk).i32(dim as i32).f32(c.norm_eps))?;
             } else {
-                self.engram_pre(l, m, (self.b.eg, self.b.ex, self.b.ekv_part, self.b.ekv))?;
+                self.engram_pre(l, m, (self.b.eg, self.b.ex, self.b.ekv_part, self.b.ekv), false)?;
                 self.launch("engram_apply", grid(4, m as u32, 256), Args::new().ptr(self.meta).ptr(self.cmp_hist).ptr(self.hbuf()).ptr(self.b.ekv).ptr(eg.qk).i32(dim as i32).f32(c.norm_eps))?;
             }
             self.hc_prep(m, self.epi(ly.hc_attn.0, false))?;
@@ -3326,29 +3651,34 @@ impl Rank {
         if ratio > 0 && !self.swa_replay.get() {
             if let Some(cp) = &ly.compressor {
                 ensure!(ratio <= 4 && hd <= 512, "compress_pool: ratio <= 4, head dim <= 512 (compress ratio {ratio}, head dim {hd})");
-                if ratio > 1 && m <= MAX_M && cp.wkvg.is_some() {
+                if ratio > 1 {
                     let (kvh, sch) = (cache.kv_hist.unwrap(), cache.sc_hist.unwrap());
-                    self.gemv(cp.wkvg.as_ref().unwrap(), x, dim, m, kvh, hd, GemvOpts { out_f32: true, split: Some((hd, sch, hd)), out_pos: Some(self.meta), ..xa })?;
-                    let (pool, nt) = ("compress_pool", 128);
-                    self.launch(
-                        pool,
-                        Launch::new(m as u32, nt),
-                        Args::new().ptr(self.meta).ptr(kvh).ptr(sch).i32(ratio as i32).ptr(cp.norm).f32(c.norm_eps).ptr(self.b.latent).i32(hd as i32),
-                    )?;
-                } else if ratio > 1 {
-                    self.gemv(&cp.wkv, x, dim, m, self.b.ckv, hd, GemvOpts { out_f32: true, ..xa })?;
-                    self.gemv(cp.wgate.as_ref().unwrap(), x, dim, m, self.b.csc, hd, GemvOpts { out_f32: true, ..xa })?;
-                    for (srcb, hist) in [(self.b.ckv, cache.kv_hist.unwrap()), (self.b.csc, cache.sc_hist.unwrap())] {
-                        self.launch(
-                            "store_hist_f32",
-                            grid((hd / 128) as u32, m as u32, 128),
-                            Args::new().ptr(self.meta).ptr(srcb).i32(hd as i32).ptr(hist).i32(hd as i32),
-                        )?;
+                    let fused = cp.wkvg.as_ref().filter(|_| m <= MAX_M);
+                    let direct = cache.hist_rows == 0 && fused.is_some();
+                    if let Some(wkvg) = fused {
+                        let (kv, scores) = if direct { (kvh, sch) } else { (self.b.ckv, self.b.csc) };
+                        self.gemv(wkvg, x, dim, m, kv, hd, GemvOpts {
+                            out_f32: true, split: Some((hd, scores, hd)),
+                            out_pos: direct.then_some(self.meta), ..xa
+                        })?;
+                    } else {
+                        self.gemv(&cp.wkv, x, dim, m, self.b.ckv, hd, GemvOpts { out_f32: true, ..xa })?;
+                        self.gemv(cp.wgate.as_ref().unwrap(), x, dim, m, self.b.csc, hd, GemvOpts { out_f32: true, ..xa })?;
+                    }
+                    let ring_rows = cache.hist_rows as i32;
+                    if !direct {
+                        for (src, hist) in [(self.b.ckv, kvh), (self.b.csc, sch)] {
+                            self.launch(
+                                "store_hist_f32",
+                                grid(hd.div_ceil(128) as u32, m as u32, 128),
+                                Args::new().ptr(self.meta).ptr(src).i32(hd as i32).ptr(hist).i32(hd as i32).i32(ring_rows),
+                            )?;
+                        }
                     }
                     self.launch(
                         "compress_pool",
                         Launch::new(m as u32, 128),
-                        Args::new().ptr(self.meta).ptr(cache.kv_hist.unwrap()).ptr(cache.sc_hist.unwrap()).i32(ratio as i32).ptr(cp.norm).f32(c.norm_eps).ptr(self.b.latent).i32(hd as i32),
+                        Args::new().ptr(self.meta).ptr(kvh).ptr(sch).i32(ratio as i32).ptr(cp.norm).f32(c.norm_eps).ptr(self.b.latent).i32(hd as i32).i32(ring_rows),
                     )?;
                 } else {
                     self.gemv(&cp.wkv, x, dim, m, self.b.latent, hd, xa)?;
@@ -3662,16 +3992,20 @@ impl Rank {
     }
 
     pub fn dspark_prep(&mut self, m: usize) -> Result<()> {
-        let c = self.cfg.clone();
-        let dim = c.dim;
-        let hd = c.head_dim;
-        let _ = (dim, hd);
+        if self.packed_rows != 0 {
+            ensure!(m <= self.host_pos_end, "invalid draft KV append position");
+            self.check_kv_mapping(self.host_pos_end)?;
+        }
         self.prep_proj(m)?;
         self.prep_gather(m)?;
         if self.prep_gather_pending.get() {
             self.ev_prep.record(&self.par)?;
         }
-        self.prep_kv(m)
+        self.prep_kv(m)?;
+        if self.packed_rows != 0 {
+            for c in &self.mtp_caches { c.record_window(self.host_pos_end - m, self.host_pos_end); }
+        }
+        Ok(())
     }
 
     fn prep_proj(&self, m: usize) -> Result<()> {
@@ -3697,19 +4031,32 @@ impl Rank {
             let og = GemvOpts { prenorm: mn, ksplit: Some(cs), ..Default::default() };
             ensure!(ops::gemv_cluster(&wg, m, &og) == cs && wg.n == nm * hd, "prep_kv: grouped wkv split");
             self.gemv(&wg, self.b.main_x, dim, m, self.b.kv_all, nm * hd, og)?;
-            let rp = |i: usize| self.rope_params(self.b.kv_all + (i * hd * 2) as u64, nm * hd, hd, 1, self.rope_base, false, Q_FP8, 0, self.mtp_caches[i].win, self.w.mtp[i].kv_norm);
+            let rp = |i: usize| RopeParams {
+                ring_rows: self.mtp_caches[i].ring_rows as i32,
+                ..self.rope_params(self.b.kv_all + (i * hd * 2) as u64, nm * hd, hd, 1, self.rope_base, false, Q_FP8, 0, self.mtp_caches[i].win, self.w.mtp[i].kv_norm)
+            };
             self.rope_pair(m, rp(0), 1, rp(1), 1)?;
             return self.rope_launch(rp(2), m);
         }
         for i in 0..self.w.mtp.len() {
             let ly = &self.w.mtp[i];
             self.gemv(&ly.wkv, self.b.main_x, dim, m, self.b.kv, hd, GemvOpts { prenorm: mn, ..Default::default() })?;
-            self.rope_n(self.b.kv, hd, hd, 1, m, self.rope_base, false, Q_FP8, 0, self.mtp_caches[i].win, ly.kv_norm)?;
+            let p = RopeParams {
+                ring_rows: self.mtp_caches[i].ring_rows as i32,
+                ..self.rope_params(self.b.kv, hd, hd, 1, self.rope_base, false, Q_FP8, 0, self.mtp_caches[i].win, ly.kv_norm)
+            };
+            self.rope_launch(p, m)?;
         }
         Ok(())
     }
 
     fn mtp_block(&mut self, i: usize, m: usize) -> Result<()> {
+        self.mtp_attention(i, m)?;
+        self.mtp_attention_output(i, m)?;
+        self.mtp_ffn(i, m)
+    }
+
+    fn mtp_attention(&mut self, i: usize, m: usize) -> Result<()> {
         let c = self.cfg.clone();
         let dim = c.dim;
         let hd = c.head_dim;
@@ -3738,6 +4085,7 @@ impl Rank {
             ratio: 0,
             dst: self.b.block_kv,
             pos_offset: 0,
+            ring_rows: 0,
             norm_w: ly.kv_norm,
             norm_eps: c.norm_eps,
             dst_by_row: 1,
@@ -3780,6 +4128,7 @@ impl Rank {
             nh: (c.n_heads / self.tp) as i32,
             pre: 0,
             win_floor: 0,
+            ring_rows: self.mtp_caches[i].ring_rows as i32,
         };
         let hgroups = heads.div_ceil(16) as u32;
         let fused = if hgroups > 1 { "attn_fused_hg" } else { "attn_fused" };
@@ -3788,10 +4137,18 @@ impl Rank {
         self.k.get(af)?.set_max_dynamic_smem(smem)?;
         let mut cfg = Launch::new(sp, 128).grid3((sp, m as u32, hgroups)).smem(smem);
         cfg.cluster = Some((sp, 1, 1));
-        self.launch(af, cfg, Args::new().ptr(self.meta).push(ap))?;
+        self.launch(af, cfg, Args::new().ptr(self.meta).push(ap))
+    }
+
+    fn mtp_attention_output(&mut self, i: usize, m: usize) -> Result<()> {
+        let c = self.cfg.clone();
+        let dim = c.dim;
+        let hd = c.head_dim;
+        let heads = c.n_heads / self.tp;
+        let ly = &self.w.mtp[i];
         let gl = c.o_groups / self.tp * c.o_lora_rank;
         let ob_part = m <= MAX_M;
-        let o2 = if ob_part && mtp2 { self.tg2_wo(ly, m)? } else { None };
+        let o2 = if ob_part { self.tg2_wo(ly, m)? } else { None };
         if o2.is_none() {
             self.gemv(&ly.wo_a, self.b.o, heads * hd, m, self.b.oa, gl, GemvOpts { x_group_rows: c.o_lora_rank, ..Default::default() })?;
         }
@@ -3810,16 +4167,27 @@ impl Rank {
         self.hc_join()?;
         self.comm_ex(ob, dim, dim, CM_SUM_HCPOST, true, hout, dim, false, Some((hin, self.b.post_a, self.b.comb_a)), ob_ns, 0, Some(self.epi_nodots()))?;
         self.hcur = 1 - self.hcur;
+        Ok(())
+    }
+
+    fn mtp_ffn(&mut self, i: usize, m: usize) -> Result<()> {
+        let topk = self.cfg.dspark_n_activated_experts;
         let ly: &Layer = &self.w.mtp[i];
         if !self.ffn_dots_in(ly, m) {
             self.hc_fork_dots(ly.hc_ffn, true, "mtp ffn")?;
         }
-        if ly.experts.sgl {
+        if m > 8 {
+            ensure!(self.pm.is_some(), "packed MTP requires grouped MoE workspace");
+            self.ffn_prefill(ly as *const Layer, m, topk)?;
+        } else if ly.experts.sgl {
             ensure!(m <= 8 && self.sgl_chain_ok(), "sgl mtp: a {m}-row drafter FFN off the decode chain");
             let ly: &'static Layer = unsafe { &*(ly as *const Layer) };
-            self.ffn_sgl(ly, m, c.dspark_n_activated_experts)?;
+            self.ffn_sgl(ly, m, topk)?;
+        } else if ly.experts.rm && !self.ffn_gate_in(ly, m) && self.pm.is_some() {
+            // A one-row draft cannot use the fused route gate on the RM profile.
+            self.ffn_prefill(ly as *const Layer, m, topk)?;
         } else {
-            self.ffn(ly as *const Layer, m, c.dspark_n_activated_experts)?;
+            self.ffn(ly as *const Layer, m, topk)?;
         }
         Ok(())
     }
@@ -3840,13 +4208,24 @@ impl Rank {
     }
 
     fn dspark_draft_tail(&mut self) -> Result<()> {
+        self.dspark_draft_head(self.blk)?;
+        self.dspark_markov(true)
+    }
+
+    fn dspark_draft_head(&self, rows: usize) -> Result<()> {
+        let head = self.w.head_fp8.as_ref().unwrap_or(&self.w.head);
+        let norm = self.w.mtp.last().unwrap().final_norm.unwrap();
+        self.gemv(head, self.b.x_raw, self.cfg.dim, rows, self.b.logits, self.w.head.n, GemvOpts {
+            out_f32: true, persist: true, ..self.xin(norm)
+        })
+    }
+
+    fn dspark_markov(&self, pdl: bool) -> Result<()> {
         let c = self.cfg.clone();
         let dim = c.dim;
         let blk = self.blk;
         let last = self.w.mtp.last().unwrap();
         let (vloc, vpad) = (c.vocab_size / self.tp, self.w.head.n);
-        let head = self.w.head_fp8.as_ref().unwrap_or(&self.w.head);
-        self.gemv(head, self.b.x_raw, dim, blk, self.b.logits, vpad, GemvOpts { out_f32: true, persist: true, ..self.xin(last.final_norm.unwrap()) })?;
         let mh = last.markov_head.unwrap();
         let me = last.markov_embed.unwrap();
         ensure!(mh.fmt == WFmt::Bf16 && mh.k == 256 && mh.n % 64 == 0 && blk <= 8 && c.dspark_markov_rank == 256);
@@ -3910,11 +4289,14 @@ impl Rank {
         }
         let smem = 2 * 16 * 2048;
         self.k.get("markov_rounds")?.set_max_dynamic_smem(smem)?;
+        // Packed lanes share the Markov sequence counter and grid barrier. The
+        // kernel reads the counter before its programmatic dependency wait.
+        let cfg = Launch::new(grid as u32, 512).smem(smem).pdl(pdl);
         if self.mk_kmax != 0 && qpc == 2 {
             self.k.get("markov_rounds_ld")?.set_max_dynamic_smem(smem)?;
-            self.launch("markov_rounds_ld", Launch::new(grid as u32, 512).smem(smem), Args::new().ptr(self.meta).push(q).ptr(self.mk_kmax))?;
+            cu::launch(self.k.get("markov_rounds_ld")?, &cfg, self.st(), Args::new().ptr(self.meta).push(q).ptr(self.mk_kmax))?;
         } else {
-            self.launch("markov_rounds", Launch::new(grid as u32, 512).smem(smem), Args::new().ptr(self.meta).push(q))?;
+            cu::launch(self.k.get("markov_rounds")?, &cfg, self.st(), Args::new().ptr(self.meta).push(q))?;
         }
         if self.mk_dump.get() != 0 {
             cu::memcpy_dtod_async(self.mk_dump.get(), self.b.logits, blk * vpad * 4, &self.stream)?;
@@ -3954,6 +4336,7 @@ impl Rank {
     }
 
     pub fn capture_spec_blk(&mut self, blk: usize) -> Result<cu::GraphExec> {
+        ensure!(self.packed_rows == 0, "standalone speculative graphs require a dense rank; use spec_decode_batch for paged slots");
         let c = self.cfg.clone();
         ensure!(blk >= 1 && blk <= c.dspark_block_size && blk + 1 <= MAX_M, "draft block {blk}");
         self.moe_rows_ok(blk + 1)?;
@@ -4002,6 +4385,7 @@ impl Rank {
     }
 
     pub fn capture_spec_vadapt(&mut self, theta: f32) -> Result<cu::GraphExec> {
+        ensure!(self.packed_rows == 0, "standalone speculative graphs require a dense rank; use spec_decode_batch for paged slots");
         let c = self.cfg.clone();
         let blk = c.dspark_block_size;
         ensure!(self.w.mtp.last().is_some_and(|l| l.confidence.is_some()) && blk + 1 <= MAX_M, "vadapt: confidence head, block {blk}");
@@ -4105,6 +4489,23 @@ impl Rank {
     }
 }
 
+fn window_copy_runs(
+    mut rows: std::ops::Range<usize>,
+    source_rows: usize,
+    destination_rows: usize,
+) -> impl Iterator<Item = (usize, usize, usize)> {
+    std::iter::from_fn(move || {
+        if rows.is_empty() {
+            return None;
+        }
+        let from = rows.start % source_rows;
+        let to = rows.start % destination_rows;
+        let count = rows.len().min(source_rows - from).min(destination_rows - to);
+        rows.start += count;
+        Some((from, to, count))
+    })
+}
+
 fn qnorm_split(n: usize) -> Option<usize> {
     let quads = n / 64;
     Some([8, 4, 2, 1].into_iter().find(|cs| quads * cs <= ops::sm_count()).unwrap_or(1))
@@ -4113,6 +4514,13 @@ fn qnorm_split(n: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_staging_splits_at_both_ring_boundaries() {
+        let runs = window_copy_runs(19..23, 5, 7).collect::<Vec<_>>();
+        assert_eq!(runs, [(4, 5, 1), (0, 6, 1), (1, 0, 2)]);
+        assert_eq!(window_copy_runs(0..0, 5, 7).count(), 0);
+    }
 
     #[test]
     fn prefill_capacity_covers_chunk_window_and_slices() {

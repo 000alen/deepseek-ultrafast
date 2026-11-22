@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dsuf-standard
+spec:
+  template:
+    spec:
+      containers:
+        - name: serve
+          args:
+            - --gpus
+            - '0,1,2,3'
+            - --port
+            - '8000'
+            - --max-seq
+            - '131072'
+            - --max-num-seqs
+            - '64'
+            - --max-num-decode-seqs
+            - '32'
+            - --max-num-active-seqs
+            - '32'
+            - --kv-cache-memory-bytes
+            - '68719476736'
+            - --hot-kv-cache-memory-bytes
+            - '17179869184'
+            - --kv-copy-mib
+            - '8'
+            - --prefill-schedule-interval
+            - '1'
+            - --max-prefill-wait-ms
+            - '50'
+            - --decode-max-gap-ms
+            - '250'
+            - --decode-min-tokens-per-sec
+            - '100'
+            - --standard-pool-max-output
+            - '8192'
+            - --max-outstanding-jobs
+            - '96'
+            - --shutdown-grace-seconds
+            - '45'

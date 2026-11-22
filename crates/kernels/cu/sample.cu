@@ -7,6 +7,8 @@ struct Meta {
     int tokens[16];
 };
 
+#include "packed_rows.cuh"
+
 constexpr int SNC = 63;
 constexpr int PKW = 8 + 3 * SNC + 1;
 constexpr int PKB = 4 + SNC + 32;
@@ -818,9 +820,7 @@ DEV void samp_block(const SampIo& p, int j, int M, const SampParams& sp, unsigne
     }
 }
 
-extern "C" __global__ void __launch_bounds__(SAMP_NT) samp_stats(const Meta* meta, const __grid_constant__ SampIo p) {
-    pdl_wait();
-    pdl_launch();
+DEV void samp_stats_body(const Meta* meta, const SampIo& p) {
 #if SAMP_CL
     const uint32_t S = samp_csize();
     const int j = (int)(blockIdx.x / S), M = meta->m, L = p.last_only ? 0 : M - 1;
@@ -1186,3 +1186,29 @@ extern "C" __global__ void __launch_bounds__(SAMP_NT) samp_stats(const Meta* met
         samp_pick(p, meta->pos, M, sp, seq);
     }
 }
+
+extern "C" __global__ void __launch_bounds__(SAMP_NT) samp_stats(const Meta* meta, const __grid_constant__ SampIo p) {
+    pdl_wait();
+    pdl_launch();
+    samp_stats_body(meta, p);
+}
+
+#if !SAMP_CL
+extern "C" __global__ void __launch_bounds__(SAMP_NT) samp_packed_ar(
+    const PackedRow* rows, int live, const __grid_constant__ SampIo common) {
+    pdl_wait();
+    pdl_launch();
+    for (int i = 0; i < live; ++i) {
+        const PackedRow row = rows[i];
+        SampIo p = common;
+        p.sp = (SampParams*)row.sampling;
+        p.logits += (size_t)i * p.vpad;
+        p.next += i;
+        if (p.spart) p.spart += (size_t)i * p.nquads * 20;
+        samp_stats_body(row.meta, p);
+        // The last writer advances the mailbox epoch and the owning sequence's RNG.
+        // Make both visible before the CTA starts another lane on the same channel.
+        __syncthreads();
+    }
+}
+#endif

@@ -1,0 +1,149 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: dsuf-standard
+spec:
+  clusterIP: None
+  selector: {app: dsuf-engine, pool: standard}
+  ports:
+    - {name: http, port: 8000, targetPort: http}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dsuf-standard
+spec:
+  serviceName: dsuf-standard
+  replicas: 2
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {app: dsuf-engine, pool: standard}
+  template:
+    metadata:
+      labels: {app: dsuf-engine, pool: standard}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 75
+      nodeSelector: {deepseek-ultrafast/gpu-profile: blackwell-tp4}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: {app: dsuf-engine}
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: serve
+          image: deepseek-ultrafast
+          args:
+            - --gpus
+            - "0,1,2,3"
+            - --port
+            - "8000"
+            - --max-seq
+            - "131072"
+            - --max-num-seqs
+            - "16"
+            - --max-num-decode-seqs
+            - "4"
+            - --kv-cache-memory-bytes
+            - "25769803776"
+            - --standard-pool-max-output
+            - "8192"
+            - --shutdown-grace-seconds
+            - "45"
+          env:
+            - name: DSUF_KV_HOST
+              valueFrom:
+                fieldRef: {fieldPath: status.podIP}
+            - {name: DSUF_REDIS_URL, value: "redis://dsuf-redis:6379"}
+          ports:
+            - {name: http, containerPort: 8000}
+            - {name: kv, containerPort: 19500}
+          resources:
+            requests: {cpu: "8", memory: 64Gi}
+            limits: {memory: 64Gi, nvidia.com/gpu: 4, rdma/hca: 1}
+          startupProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+            failureThreshold: 120
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 2
+          volumeMounts:
+            - {name: models, mountPath: /models, readOnly: true}
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: deepseek-ultrafast-models
+            readOnly: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dsuf-long
+spec:
+  clusterIP: None
+  selector: {app: dsuf-engine, pool: long}
+  ports:
+    - {name: http, port: 8000, targetPort: http}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dsuf-long
+spec:
+  serviceName: dsuf-long
+  replicas: 1
+  selector:
+    matchLabels: {app: dsuf-engine, pool: long}
+  template:
+    metadata:
+      labels: {app: dsuf-engine, pool: long}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 75
+      nodeSelector: {deepseek-ultrafast/gpu-profile: blackwell-tp4}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: {app: dsuf-engine}
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: serve
+          image: deepseek-ultrafast
+          args: ["--gpus", "0,1,2,3", "--port", "8000", "--max-seq", "1048576", "--max-num-seqs", "1", "--shutdown-grace-seconds", "45"]
+          env:
+            - name: DSUF_KV_HOST
+              valueFrom:
+                fieldRef: {fieldPath: status.podIP}
+            - {name: DSUF_REDIS_URL, value: "redis://dsuf-redis:6379"}
+          ports:
+            - {name: http, containerPort: 8000}
+            - {name: kv, containerPort: 19500}
+          resources:
+            requests: {cpu: "8", memory: 64Gi}
+            limits: {memory: 64Gi, nvidia.com/gpu: 4, rdma/hca: 1}
+          startupProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+            failureThreshold: 120
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 2
+          volumeMounts:
+            - {name: models, mountPath: /models, readOnly: true}
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: deepseek-ultrafast-models
+            readOnly: true
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: dsuf-standard
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app: dsuf-engine, pool: standard}

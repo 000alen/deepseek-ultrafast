@@ -4,6 +4,7 @@ use std::ffi::{CString, c_void};
 use std::ptr::{null, null_mut};
 
 pub mod profile;
+pub mod virtual_memory;
 
 pub type DevPtr = u64;
 
@@ -368,6 +369,14 @@ impl Event {
     }
     pub fn record(&self, s: &Stream) -> Result<()> {
         ck!(sys::cuEventRecord(self.raw, s.raw))
+    }
+    pub fn is_ready(&self) -> Result<bool> {
+        let result = unsafe { sys::cuEventQuery(self.raw) };
+        if result == sys::CUresult::CUDA_ERROR_NOT_READY {
+            return Ok(false);
+        }
+        check(result, "cuEventQuery")?;
+        Ok(true)
     }
     pub fn synchronize(&self) -> Result<()> {
         ck!(sys::cuEventSynchronize(self.raw))
@@ -832,6 +841,43 @@ mod tests {
     use super::*;
 
     const PTX: &str = ".version 8.0\n.target sm_90\n.address_size 64\n.visible .entry k(.param .u64 p)\n{\n.reg .b64 %rd<3>;\n.reg .b32 %r<2>;\nld.param.u64 %rd1, [p];\ncvta.to.global.u64 %rd2, %rd1;\nmov.u32 %r1, 7;\nst.global.u32 [%rd2], %r1;\nret;\n}\n";
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn query_copy_completion_after_cross_stream_wait() -> Result<()> {
+        init()?;
+        let _device = Device::new(0)?;
+        let producer = Stream::new()?;
+        let copy = Stream::new()?;
+        let source = Buffer::alloc(4)?;
+        let mut staged = PinnedHost::alloc(4)?;
+        let written = Event::new()?;
+        let received = Event::new()?;
+
+        let transfer = (|| -> Result<()> {
+            memset_d32_async(source.ptr, 0x1234_5678, 1, &producer)?;
+            written.record(&producer)?;
+            copy.wait(&written)?;
+            memcpy_dtoh_async(staged.as_mut_slice::<u32>(), source.ptr, &copy)?;
+            received.record(&copy)?;
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !received.is_ready()? {
+                if std::time::Instant::now() >= deadline {
+                    bail!("test copy did not complete before its deadline");
+                }
+                std::thread::yield_now();
+            }
+            Ok(())
+        })();
+        if transfer.is_err() {
+            let _ = copy.synchronize();
+            let _ = producer.synchronize();
+        }
+        transfer?;
+        assert_eq!(staged.as_slice::<u32>(), &[0x1234_5678]);
+        Ok(())
+    }
 
     #[test]
     #[ignore]

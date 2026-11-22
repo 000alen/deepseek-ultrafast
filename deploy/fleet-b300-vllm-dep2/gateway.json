@@ -1,0 +1,99 @@
+{
+  "listen": "0.0.0.0:8080",
+  "max_active": 512,
+  "max_pending": 128,
+  "standard_max_output_tokens": 8192,
+  "tenants": [
+    {
+      "id": "coding",
+      "token_env": "DSUF_CODING_TOKEN",
+      "max_active": 512,
+      "max_pending": 128,
+      "max_buffered_bytes": 536870912,
+      "max_reserved_output_tokens": 4194304
+    }
+  ],
+  "backends": [
+    {
+      "id": "standard-0",
+      "url": "http://dsuf-standard-0.dsuf-standard:8000",
+      "pool": "standard",
+      "cohort": "vllm-dep2-b300-128k",
+      "max_inflight": 64,
+      "readiness_path": "/health",
+      "probe_capacity": false,
+      "vllm_cache_salt": true
+    },
+    {
+      "id": "standard-1",
+      "url": "http://dsuf-standard-1.dsuf-standard:8000",
+      "pool": "standard",
+      "cohort": "vllm-dep2-b300-128k",
+      "max_inflight": 64,
+      "readiness_path": "/health",
+      "probe_capacity": false,
+      "vllm_cache_salt": true
+    },
+    {
+      "id": "standard-2",
+      "url": "http://dsuf-standard-2.dsuf-standard:8000",
+      "pool": "standard",
+      "cohort": "vllm-dep2-b300-128k",
+      "max_inflight": 64,
+      "readiness_path": "/health",
+      "probe_capacity": false,
+      "vllm_cache_salt": true
+    },
+    {
+      "id": "standard-3",
+      "url": "http://dsuf-standard-3.dsuf-standard:8000",
+      "pool": "standard",
+      "cohort": "vllm-dep2-b300-128k",
+      "max_inflight": 64,
+      "readiness_path": "/health",
+      "probe_capacity": false,
+      "vllm_cache_salt": true
+    },
+    {
+      "id": "standard-4",
+      "url": "http://dsuf-standard-4.dsuf-standard:8000",
+      "pool": "standard",
+      "cohort": "vllm-dep2-b300-128k",
+      "max_inflight": 64,
+      "readiness_path": "/health",
+      "probe_capacity": false,
+      "vllm_cache_salt": true
+    },
+    {
+      "id": "standard-5",
+      "url": "http://dsuf-standard-5.dsuf-standard:8000",
+      "pool": "standard",
+      "cohort": "vllm-dep2-b300-128k",
+      "max_inflight": 64,
+      "readiness_path": "/health",
+      "probe_capacity": false,
+      "vllm_cache_salt": true
+    },
+    {
+      "id": "standard-6",
+      "url": "http://dsuf-standard-6.dsuf-standard:8000",
+      "pool": "standard",
+      "cohort": "vllm-dep2-b300-128k",
+      "max_inflight": 64,
+      "readiness_path": "/health",
+      "probe_capacity": false,
+      "vllm_cache_salt": true
+    },
+    {
+      "id": "standard-7",
+      "url": "http://dsuf-standard-7.dsuf-standard:8000",
+      "pool": "standard",
+      "cohort": "vllm-dep2-b300-128k",
+      "max_inflight": 64,
+      "readiness_path": "/health",
+      "probe_capacity": false,
+      "vllm_cache_salt": true
+    }
+  ],
+  "standard_accepts_images": false
+}

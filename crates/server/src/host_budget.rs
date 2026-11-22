@@ -7,7 +7,9 @@ const FIXED_SLACK: u64 = 64 * MIB;
 const CACHE_FRACTION: f64 = 0.75;
 
 #[derive(Clone, Debug, Default)]
-pub struct Settings;
+pub struct Settings {
+    pub resident_candidate_leases: usize,
+}
 
 #[derive(Debug)]
 pub struct Available {
@@ -49,8 +51,9 @@ impl Settings {
         let evaluate = |cache: u64| -> Option<(u64, u64, u64)> {
             let snapshot = cache.min(raw_image_max as u64);
             let queued = deepseek_ultrafast_server::request_queue::MAX_PREPARED_REQUESTS as u64;
-            let lease_and_work =
-                (deepseek_ultrafast_kv_transfer::MAX_LEASES as u64 + queued + 2).checked_mul(snapshot)?;
+            let lease_count = (deepseek_ultrafast_kv_transfer::MAX_LEASES as u64 + queued + 2)
+                .checked_add(self.resident_candidate_leases as u64)?;
+            let lease_and_work = lease_count.checked_mul(snapshot)?;
             let receive = snapshot
                 .max(2 * MIB)
                 .checked_next_power_of_two()?

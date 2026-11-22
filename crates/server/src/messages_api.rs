@@ -20,7 +20,12 @@ fn error_value(status: StatusCode, message: String) -> Value {
 }
 impl IntoResponse for MessagesError {
     fn into_response(self) -> Response {
-        (self.0.0, axum::Json(error_value(self.0.0, self.0.1))).into_response()
+        let admission = self.0.admission();
+        let mut response = (self.0.0, axum::Json(error_value(self.0.0, self.0.1))).into_response();
+        if let Some(value) = admission {
+            response.headers_mut().insert(ADMISSION_HEADER, axum::http::HeaderValue::from_static(value));
+        }
+        response
     }
 }
 pub(super) fn log_reason(trace: &Trace, reason: Option<&MessagesStopReason>) {
@@ -33,10 +38,6 @@ pub(super) fn log_reason(trace: &Trace, reason: Option<&MessagesStopReason>) {
         });
     }
 }
-fn engine_error() -> ApiError {
-    ApiError(StatusCode::INTERNAL_SERVER_ERROR, "engine stopped before completing the message".into())
-}
-
 pub(super) async fn create_message(
     State(app): State<Arc<App>>,
     Extension(trace): Extension<Trace>,
@@ -60,10 +61,7 @@ pub(super) async fn create_message(
         seed,
         ..Default::default()
     };
-    let (tokens, images) =
-        crate::images::prepare(app.tok.clone(), prepared.prompt, prepared.literal_breaks, prepared.image_offsets, prepared.image_sources, app.max_seq)
-            .await
-            .map_err(image_error)?;
+    let (tokens, images) = prepare_prompt(&app, prepared.prompt, prepared.literal_breaks, prepared.image_offsets, prepared.image_sources).await?;
     trace.parsed(tokens.len());
     let g = submit(&app, RequestContext { trace: trace.clone(), ingress }, tokens, &sampling, None, images)?;
     let headers = session_headers(&g);
@@ -77,8 +75,7 @@ pub(super) async fn create_message(
             loop {
                 let next = tokio::select! { _ = tx.closed() => return, next = chunks.next() => next };
                 let Some(chunk) = next else { break };
-                let chunk = if failed.load(Ordering::Relaxed) { Err(engine_error().1) } else { chunk.map_err(|e| e.to_string()) };
-                match chunk {
+                match response_chunk(chunk, &failed, "message") {
                     Ok(event) => {
                         if let MessagesStreamEvent::MessageDelta { delta, .. } = &event {
                             log_reason(&trace, delta.stop_reason.as_ref());
@@ -87,17 +84,15 @@ pub(super) async fn create_message(
                             return;
                         }
                     }
-                    Err(message) => {
+                    Err(error) => {
                         trace.reason("error");
-                        let _ = tx.send(error_value(StatusCode::INTERNAL_SERVER_ERROR, message)).await;
+                        let _ = tx.send(error_value(error.0, error.1)).await;
                         return;
                     }
                 }
             }
-            if failed.load(Ordering::Relaxed) {
-                trace.reason("error");
-                let _ = tx.send(error_value(StatusCode::INTERNAL_SERVER_ERROR, engine_error().1)).await;
-                return;
+            if let Some(error) = generation_error(&failed, "message") {
+                let _ = tx.send(error_value(error.0, error.1)).await;
             }
         });
         let events = tokio_stream::wrappers::ReceiverStream::new(rx)
@@ -107,13 +102,10 @@ pub(super) async fn create_message(
     let mut response = MessagesResponse::new(id, model, now(), 0, 0);
     let mut chunks = std::pin::pin!(chunks);
     while let Some(chunk) = chunks.next().await {
-        if failed.load(Ordering::Relaxed) {
-            return Err(engine_error().into());
-        }
-        response.append(chunk.map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?);
+        response.append(response_chunk(chunk, &failed, "message")?);
     }
-    if failed.load(Ordering::Relaxed) {
-        return Err(engine_error().into());
+    if let Some(error) = generation_error(&failed, "message") {
+        return Err(error.into());
     }
     log_reason(&trace, response.stop_reason.as_ref());
     Ok((headers, axum::Json(response)).into_response())

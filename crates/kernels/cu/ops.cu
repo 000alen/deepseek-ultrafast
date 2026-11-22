@@ -7,6 +7,50 @@ struct Meta {
     int tokens[16];
 };
 
+#include "packed_rows.cuh"
+
+struct RowUpload { PackedRow rows[32]; };
+extern "C" __global__ void install_packed_rows(PackedRow* dest, const __grid_constant__ RowUpload upload,
+                                                int base, int count, int autoregressive) {
+    pdl_wait();
+    pdl_launch();
+    const int i = threadIdx.x;
+    if (i >= count) return;
+    PackedRow row = upload.rows[i];
+    dest[base + i] = row;
+    if (autoregressive) {
+        row.meta->pos = row.position;
+        row.meta->m = 1;
+        row.meta->tokens[0] = row.anchor;
+    }
+}
+
+extern "C" __global__ void set_packed_meta(Meta* metas, int rows) {
+    pdl_wait();
+    pdl_launch();
+    const int i = threadIdx.x;
+    if (i > (rows + 15) / 16) return;
+    metas[i].pos = i ? (i - 1) * 16 : 0;
+    metas[i].m = i ? min(16, rows - (i - 1) * 16) : rows;
+}
+
+extern "C" __global__ void embed_packed(const PackedRow* rows, const bf16* table, bf16* hidden,
+                                        int dim, int hc, const int* token_map) {
+    pdl_wait();
+    pdl_launch();
+    const int i = blockIdx.x;
+    const PackedRow row = rows[i];
+    uint4* dst = (uint4*)(hidden + (size_t)i * hc * dim);
+    if (!row.meta) {
+        for (int d = threadIdx.x; d < hc * dim / 8; d += blockDim.x) dst[d] = make_uint4(0, 0, 0, 0);
+        return;
+    }
+    const int tok = row.meta->tokens[row.local];
+    const uint4* src = (const uint4*)(table + (size_t)tok * dim);
+    for (int d = threadIdx.x; d < hc * dim / 8; d += blockDim.x) dst[d] = src[d % (dim / 8)];
+    if (threadIdx.x == 0) row.history[row.position] = token_map[tok];
+}
+
 DEV float bf(bf16 v) { return __bfloat162float(v); }
 DEV bf16 tobf(float v) { return __float2bfloat16(v); }
 
@@ -59,6 +103,50 @@ extern "C" __global__ void __launch_bounds__(64) rope_quant2(const Meta* meta, c
     else rope_body((const int*)meta, p2, blockIdx.x - n1, threadIdx.x, 0);
 }
 
+extern "C" __global__ void __launch_bounds__(64) rope_packed_qkv(
+    const PackedRow* rows, int layer, const __grid_constant__ RopeParams q, const __grid_constant__ RopeParams kv) {
+    pdl_wait();
+    const int global = blockIdx.y;
+    const PackedRow row = rows[global];
+    if (!row.meta) return;
+    const int head = blockIdx.x;
+    const bool is_kv = head == q.rows_per_token;
+    RopeParams p = is_kv ? kv : q;
+    p.x += (size_t)(global - row.local) * p.rows_per_token * p.ldx;
+    if (is_kv) {
+        p.dst = row.layers[layer].window;
+        p.ring_rows = row.layers[layer].ring_rows;
+    }
+    rope_body((const int*)row.meta, p, row.local * p.rows_per_token + (is_kv ? 0 : head), threadIdx.x, 0);
+}
+
+extern "C" __global__ void __launch_bounds__(64) rope_packed_compressed(const PackedRow* rows, int layer,
+    const __grid_constant__ RopeParams key, const __grid_constant__ RopeParams comp) {
+    pdl_wait();
+    const PackedRow row = rows[blockIdx.y];
+    if (!row.meta) return;
+    const PackedLayer cache = row.layers[layer];
+    const bool is_key = blockIdx.x == 0;
+    RopeParams p = is_key ? key : comp;
+    p.x += (size_t)(blockIdx.y - row.local) * p.ldx;
+    p.dst = is_key ? cache.keys : cache.compressed;
+    if (is_key) {
+        p.q4 = cache.keys_fp4;
+        p.sf4 = cache.key_scales;
+    }
+    rope_body((const int*)row.meta, p, row.local, threadIdx.x, 0);
+}
+
+extern "C" __global__ void __launch_bounds__(64) rope_packed_index_q(
+    const PackedRow* rows, const __grid_constant__ RopeParams common) {
+    pdl_wait();
+    const PackedRow row = rows[blockIdx.y];
+    if (!row.meta) return;
+    RopeParams p = common;
+    p.x += (size_t)(blockIdx.y - row.local) * p.rows_per_token * p.ldx;
+    rope_body((const int*)row.meta, p, row.local * p.rows_per_token + blockIdx.x, threadIdx.x, 0);
+}
+
 extern "C" __global__ void scale_bf16(const Meta* meta, bf16* x, int n_per_token, float alpha) {
     pdl_wait();
     pdl_launch();
@@ -74,14 +162,20 @@ struct EngramHash {
     int max_ngram, heads, pad_id;
 };
 
-extern "C" __global__ void engram_gather(const Meta* meta, const int* cmp_hist, const EngramHash hp,
+DEV void engram_gather_body(const Meta* meta, const PackedRow* rows_by_slot, const int* cmp_hist, const EngramHash hp,
                                          const uint8_t* table, const uint8_t* scales, long long row0,
                                          long long rows, float* out, int head_dim) {
     pdl_wait();
     pdl_launch();
     const int col = blockIdx.x, m = blockIdx.y;
-    if (m >= meta->m) return;
-    const int pos = meta->pos + m;
+    if (!rows_by_slot && m >= meta->m) return;
+    if (rows_by_slot && !rows_by_slot[m].meta) {
+        float* dst = out + ((size_t)m * gridDim.x + col) * head_dim;
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) dst[d] = 0.f;
+        return;
+    }
+    const int pos = rows_by_slot ? rows_by_slot[m].position : meta->pos + m;
+    if (rows_by_slot) cmp_hist = rows_by_slot[m].history;
     const int n = col / hp.heads + 1;
     const int h = col % hp.heads;
     long long rolling = 0;
@@ -111,6 +205,15 @@ extern "C" __global__ void engram_gather(const Meta* meta, const int* cmp_hist, 
     o[e + 1] = bf(tobf(__half2float(__ushort_as_half((unsigned short)(h0 >> 16))) * sc));
     o[e + 2] = bf(tobf(__half2float(__ushort_as_half((unsigned short)(h1 & 0xffff))) * sc));
     o[e + 3] = bf(tobf(__half2float(__ushort_as_half((unsigned short)(h1 >> 16))) * sc));
+}
+
+extern "C" __global__ void engram_gather(const Meta* meta, const int* hist, const EngramHash hp,
+    const uint8_t* table, const uint8_t* scales, long long row0, long long rows, float* out, int dim) {
+    engram_gather_body(meta, nullptr, hist, hp, table, scales, row0, rows, out, dim);
+}
+extern "C" __global__ void engram_gather_packed(const PackedRow* packed, const int* hist, const EngramHash hp,
+    const uint8_t* table, const uint8_t* scales, long long row0, long long rows, float* out, int dim) {
+    engram_gather_body(nullptr, packed, hist, hp, table, scales, row0, rows, out, dim);
 }
 
 struct EgPeers {
@@ -241,13 +344,15 @@ extern "C" __global__ void __launch_bounds__(256) engram_apply_peer(const Meta* 
     }
 }
 
-extern "C" __global__ void __launch_bounds__(256) engram_apply(const Meta* meta, const int* cmp_hist, bf16* h, const bf16* kv,
+DEV void engram_apply_body(const Meta* meta, const PackedRow* rows, const int* cmp_hist, bf16* h, const bf16* kv,
                                                               const float* qk, int dim, float eps) {
     pdl_wait();
     pdl_launch();
     __shared__ float sh[8];
     const int c = blockIdx.x, m = blockIdx.y;
-    if (m >= meta->m || cmp_hist[meta->pos + m] == -1) return;
+    if (rows) {
+        if (!rows[m].meta || rows[m].history[rows[m].position] == -1) return;
+    } else if (m >= meta->m || cmp_hist[meta->pos + m] == -1) return;
     bf16* hr = h + ((size_t)m * 4 + c) * dim;
     const bf16* key = kv + (size_t)m * 5 * dim + (size_t)c * dim;
     const bf16* val = kv + (size_t)m * 5 * dim + (size_t)4 * dim;
@@ -267,6 +372,15 @@ extern "C" __global__ void __launch_bounds__(256) engram_apply(const Meta* meta,
     const float sg = copysignf(sqrtf(fmaxf(fabsf(dv), 1e-6f)), dv);
     const float gate = 1.f / (1.f + expf(-sg));
     for (int d = threadIdx.x; d < dim; d += 256) hr[d] = tobf(bf(hr[d]) + gate * bf(val[d]));
+}
+
+extern "C" __global__ void __launch_bounds__(256) engram_apply(const Meta* meta, const int* hist,
+    bf16* h, const bf16* kv, const float* qk, int dim, float eps) {
+    engram_apply_body(meta, nullptr, hist, h, kv, qk, dim, eps);
+}
+extern "C" __global__ void __launch_bounds__(256) engram_apply_packed(const PackedRow* rows, const int* hist,
+    bf16* h, const bf16* kv, const float* qk, int dim, float eps) {
+    engram_apply_body(nullptr, rows, hist, h, kv, qk, dim, eps);
 }
 
 #define MOE_MAX_SLOTS 97

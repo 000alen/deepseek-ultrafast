@@ -3,6 +3,7 @@ pub mod chat;
 pub mod generation;
 pub mod request_log;
 pub mod request_queue;
+pub mod scheduler;
 pub mod image_identity;
 pub mod images;
 mod literal_text;

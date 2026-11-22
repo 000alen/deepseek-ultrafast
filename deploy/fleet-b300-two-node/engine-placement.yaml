@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dsuf-standard
+spec:
+  template:
+    spec:
+      nodeSelector:
+        deepseek-ultrafast/gpu-profile: b300-two-node
+      affinity: null
+      topologySpreadConstraints:
+        - maxSkew: 1
+          minDomains: 2
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          nodeAffinityPolicy: Honor
+          nodeTaintsPolicy: Honor
+          labelSelector:
+            matchLabels:
+              app: dsuf-engine
+      containers:
+        - name: serve
+          env:
+            - name: CUDA_DEVICE_ORDER
+              value: PCI_BUS_ID
+          resources:
+            requests:
+              cpu: '16'
+              memory: 256Gi
+            limits:
+              memory: 256Gi
+          startupProbe:
+            periodSeconds: 10
+            failureThreshold: 180
+      volumes:
+        - name: models
+          persistentVolumeClaim: null
+          hostPath:
+            path: /srv/dsuf/models
+            type: Directory

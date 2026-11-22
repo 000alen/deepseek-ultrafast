@@ -1,4 +1,4 @@
-#include "common.cuh"
+#include "attn_params.cuh"
 
 struct Meta {
     int pos;
@@ -26,24 +26,6 @@ DEV void ldsm_x2_t(uint32_t* r, const void* p) {
 }
 
 constexpr int AH = 16, AD = 512, ALD = AD + 8;
-
-struct AttnFParams {
-    const bf16* q;
-    const bf16* win;
-    const bf16* comp;
-    const int* topk;
-    int ktop;
-    float scale;
-    const float* sink;
-    bf16* out;
-    const float* cos;
-    const float* sin;
-    int R;
-    int fixed_window;
-    int nh;
-    int pre;
-    int win_floor;
-};
 
 DEV uint32_t cl_rank_a() { uint32_t r; asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(r)); return r; }
 DEV uint32_t cl_size_a() { uint32_t r; asm volatile("mov.u32 %0, %%cluster_nctarank;" : "=r"(r)); return r; }
@@ -120,7 +102,7 @@ DEV void attn_aud_body(const Meta* meta, const AttnFParams& p) {
             if (s < 128) {
                 const int ps_ = wend - 127 + s;
                 if (ps_ < p.win_floor) return nullptr;
-                return ((p.pre & 1) && ps_ < pos0) ? p.win + (size_t)ps_ * AD : (const bf16*)1;
+                return ((p.pre & 1) && ps_ < pos0) ? p.win + (size_t)cache_row(ps_, p.ring_rows) * AD : (const bf16*)1;
             }
             if (s >= nslots) return nullptr;
             if (!(p.pre & 2)) return (const bf16*)1;
@@ -164,7 +146,7 @@ DEV void attn_aud_body(const Meta* meta, const AttnFParams& p) {
         if (valid[i] != -1) continue;
         const int s = s0 + i;
         const bf16* row = nullptr;
-        if (s < 128) { if (wend - 127 + s >= p.win_floor) row = p.win + (size_t)(wend - 127 + s) * AD; }
+        if (s < 128) { if (wend - 127 + s >= p.win_floor) row = p.win + (size_t)cache_row(wend - 127 + s, p.ring_rows) * AD; }
         else if (s < nslots) { const int j = p.topk[m * p.ktop + (s - 128)]; if (j >= 0) row = p.comp + (size_t)j * AD; }
         valid[i] = row != nullptr ? 2 : 0;
         if (row) atomicAdd(&nvalid, 1);
@@ -184,7 +166,7 @@ DEV void attn_aud_body(const Meta* meta, const AttnFParams& p) {
     for (int i = tid; i < R; i += 128) {
         if (valid[i] != 2) continue;
         const int s = s0 + i;
-        const bf16* row = s < 128 ? p.win + (size_t)(wend - 127 + s) * AD : p.comp + (size_t)p.topk[m * p.ktop + (s - 128)] * AD;
+        const bf16* row = s < 128 ? p.win + (size_t)cache_row(wend - 127 + s, p.ring_rows) * AD : p.comp + (size_t)p.topk[m * p.ktop + (s - 128)] * AD;
         bulk_g2s(kv + i * ALD, row, AD * 2, &bar);
     }
     asm volatile("{ .reg .pred P; W_%=: mbarrier.try_wait.parity.shared::cta.b64 P, [%0], 0; @!P bra W_%=; }" ::"r"(sm_addr(&bar)) : "memory");

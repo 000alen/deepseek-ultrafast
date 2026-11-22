@@ -47,6 +47,96 @@ CED bounded SWA replay prefill is always enabled, with no runtime feature flag. 
 full-prompt decoder work and reconstructs the decoder's 128-row window. Short prefix hits
 reuse retained encoder outputs where available; decoder replay KV is never prefix state.
 
+## Packed decode canary
+
+The default `--max-num-seqs 1` selects the incumbent adaptive DSpark engine. Set
+`--max-num-seqs` to 2–64 to enable continuous batching. This is a GPU residency cap
+covering prefill, decode, transfers, and retirement. `--max-num-decode-seqs` independently
+caps the sequences in one packed launch. The current kernels accept at most eight
+target rows across that launch. `--packed-drafts N` enables fixed-width DSpark and
+charges `N + 1` target rows per sequence. It defaults to 0 for autoregressive decode.
+
+The canary accepts a `--max-seq` from 128 to 1,048,576 tokens. Each sequence reserves
+credit for its prompt, output cap, and speculative headroom. CUDA maps physical pages as
+the sequence grows and releases them after its last GPU copy. This keeps stable addresses
+for CUDA kernels and tensor maps. The replica shares a per-rank `--kv-cache-memory-bytes`
+budget across slots. The effective allocation accounts for fixed slot state, snapshot
+staging, and free memory on the limiting rank. Readiness requires room for one
+maximum-length request. The `packed_decode_ready` log reports the resolved allocation.
+
+```sh
+target/release/serve --ckpt models --gpus 0,1,2,3 --max-seq 8192 --chunk 1024 \
+  --max-num-seqs 2 --kv-cache-memory-bytes 4294967296
+```
+
+`--max-num-decode-seqs` sets the number of lanes per launch. A launch fits up to
+128 target rows, and each lane uses one row plus its number of drafts. Without an
+explicit launch width, the packed engine uses the eight-row canary default.
+`--max-num-active-seqs` separately caps decoding requests. Optional
+`--decode-max-gap-ms` and `--decode-min-tokens-per-sec` use observed step timings
+to limit new decoders.
+
+`--max-num-batched-tokens` budgets target rows. `--busy-prefill-ms` sets the
+time budget for busy prefill, with a 256-row cap on busy encoder chunks.
+`--prefill-schedule-interval` spaces busy prefills by decode steps, and
+`--max-prefill-wait-ms` bounds how long that spacing can defer an eligible prefill.
+The packed path stages one image per step and uses its embeddings for prefill and
+replay. `--kv-copy-mib` sets the bounded async restore and export quantum from 2
+to 8 MiB. `--hot-kv-cache-memory-bytes` optionally lets completed branches retain
+evictable pages within the configured KV pool. Snapshot fingerprints isolate
+packed variants by decode numerics and draft width.
+
+Ingress accepts at most 64 outstanding jobs and 256 MiB of retained inputs by default.
+Configure those counts with `--max-outstanding-jobs` and `--max-outstanding-bytes`.
+Full and closed ingress return HTTP 429 and 503 before SSE. A filled output buffer
+produces a terminal stream error. Shutdown closes ingress and cancels any remaining jobs
+after `--shutdown-grace-seconds` (45 seconds by default).
+
+The [fleet gateway](GATEWAY.md) consumes private `GET /internal/admission` reports.
+`--standard-pool-max-output 8192` enables strict eligibility checks on that pool.
+Oversized output requests or rendered prompts receive a pre-admission
+`X-DSUF-Admission: context` response so the gateway can use its larger pool.
+
+`run --batch-tokens prompts.json --decode 32` compares seeded packed decode with
+isolated decode using dense-address storage. For wider trials, use 32 or 64 arrays
+of prompt token IDs with different lengths. Include prompts longer than 8,319
+tokens to exercise ring wrap. Add `--packed-drafts 1` to exercise DSpark, and keep
+the total verifier rows within 128.
+`DSUF_PACKED_GRAPHS=0` runs the same wide target kernels eagerly for parity
+checks and graph comparisons. The configured wide row shape is fixed throughout
+the replica to keep kernel selection stable as active lanes come and go.
+The parity probe also reports teacher-forced logit drift against the incumbent
+one-row forward. Set `--batch-logit-max-abs` to apply an explicit threshold.
+Set `DSUF_TRACE_BATCH_STEPS=1` to record slot and generation pairs in each
+`packed_decode_step`.
+
+On a Blackwell host, run the CUDA page reuse smoke test before testing the model or fleet.
+
+```sh
+cargo test -p deepseek-ultrafast-cuda stable_address_with_growing_and_reused_backing -- --ignored
+```
+
+[`tools/bench_coding.py`](../tools/bench_coding.py) replays Chat Completions SSE turns.
+Each manifest session has an `id` and `turns` with full-history `body` objects.
+`gap_s` sets the delay after the previous completed turn in closed-loop mode.
+`at_s` sets absolute arrival offsets in open-loop mode.
+
+```sh
+python3 tools/bench_coding.py workload.json --mode closed --sessions 500
+python3 tools/bench_coding.py workload.json --mode open --sessions 500 --arrival-scale 1.5
+```
+
+Use `--qualify sessions` or `--qualify streams` for the sustained 500-user gates.
+The replay classifies warm and cold latency using backend-reported token usage.
+Use `--qualify load` with `--min-turns-per-s` for an arrival-rate gate.
+Production qualification requires a replica inventory, a matching GPU count,
+live served-model evidence, and at least 20 observed warm and 20 cold latency
+samples. Use `--milestone-s` for a short development or mock run. The
+[two-node runbook](../deploy/README.md#two-8b300-hosts) covers baseline comparisons
+and operator-triggered host-loss trials.
+
+See the [continuous batching spec](CONTINUOUS_BATCHING.md) for the qualification gates.
+
 ## Endpoints
 - **`GET /health`, `GET /readyz`, `GET /v1/models`**
 - **`POST /v1/responses`**: stateless JSON / named SSE via deepseek-recipe, including plaintext

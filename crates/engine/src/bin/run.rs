@@ -1,6 +1,6 @@
 use anyhow::Result;
 use deepseek_ultrafast_cuda as cu;
-use deepseek_ultrafast_engine::model::{Meta, Rank};
+use deepseek_ultrafast_engine::model::{DecodeSlot, DecodeToken, MAX_PACKED_DECODE_WIDTH, Meta, Rank, SpecDecoded};
 use deepseek_ultrafast_engine::weights::{Arena, Loader};
 use deepseek_ultrafast_model::config::Config;
 use deepseek_ultrafast_model::st::Checkpoint;
@@ -8,13 +8,14 @@ use std::path::PathBuf;
 use std::sync::{Barrier, Mutex};
 use std::time::Instant;
 
-const USAGE: &str = "run --tokens <json> [--ckpt DIR] [--gpus 0,1,..] [--decode N] [--max-seq N] \
-[--chunk N] [--seed N] [--runs N] [--fixed-block N] [--dump-tokens FILE] [--samp-test N] [--score FILE]";
+const USAGE: &str = "run (--tokens <json> | --batch-tokens <json>) [--ckpt DIR] [--gpus 0,1,..] [--decode N] [--max-seq N] \
+[--chunk N] [--seed N] [--runs N] [--fixed-block N] [--packed-drafts N] [--batch-logit-max-abs F] [--dump-tokens FILE] [--samp-test N] [--score FILE]";
 
 struct Args {
     ckpt: PathBuf,
     gpus: Vec<i32>,
     prompt: Vec<i32>,
+    batch_prompts: Option<Vec<Vec<i32>>>,
     decode: usize,
     max_seq: usize,
     chunk: usize,
@@ -24,6 +25,8 @@ struct Args {
     score: Option<Vec<i32>>,
     runs: usize,
     fixed_block: Option<usize>,
+    packed_drafts: usize,
+    batch_logit_max_abs: Option<f32>,
 }
 
 fn parse_args(v: &[String]) -> Result<Args> {
@@ -31,6 +34,7 @@ fn parse_args(v: &[String]) -> Result<Args> {
         ckpt: PathBuf::from("/models"),
         gpus: vec![0, 1, 2, 3],
         prompt: vec![],
+        batch_prompts: None,
         decode: 8,
         max_seq: 8192,
         chunk: 8192,
@@ -40,6 +44,8 @@ fn parse_args(v: &[String]) -> Result<Args> {
         score: None,
         runs: 1,
         fixed_block: None,
+        packed_drafts: 0,
+        batch_logit_max_abs: None,
     };
     let ids = |v: &serde_json::Value| -> Vec<i32> { v.as_array().map(|a| a.iter().map(|x| x.as_i64().unwrap() as i32).collect()).unwrap_or_default() };
     let mut i = 1;
@@ -53,10 +59,17 @@ fn parse_args(v: &[String]) -> Result<Args> {
             "--chunk" => a.chunk = val()?.parse()?,
             "--seed" => a.seed = val()?.parse()?,
             "--tokens" => a.prompt = serde_json::from_str(&std::fs::read_to_string(val()?)?)?,
+            "--batch-tokens" => a.batch_prompts = Some(serde_json::from_str(&std::fs::read_to_string(val()?)?)?),
             "--dump-tokens" => a.dump_tokens = Some(val()?.into()),
             "--samp-test" => a.samp_test = Some(val()?.parse()?),
             "--runs" => a.runs = val()?.parse()?,
             "--fixed-block" => a.fixed_block = Some(val()?.parse()?),
+            "--packed-drafts" => a.packed_drafts = val()?.parse()?,
+            "--batch-logit-max-abs" => {
+                let threshold: f32 = val()?.parse()?;
+                anyhow::ensure!(threshold.is_finite() && threshold >= 0., "--batch-logit-max-abs requires a finite, nonnegative value");
+                a.batch_logit_max_abs = Some(threshold);
+            }
             "--score" => {
                 let j: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(val()?)?)?;
                 a.prompt = ids(&j["input_ids"]);
@@ -66,7 +79,19 @@ fn parse_args(v: &[String]) -> Result<Args> {
         }
         i += 2;
     }
-    anyhow::ensure!(!a.prompt.is_empty(), "no prompt (use --tokens or --score)\nusage: {USAGE}");
+    if let Some(prompts) = &a.batch_prompts {
+        anyhow::ensure!(a.prompt.is_empty() && a.score.is_none() && a.samp_test.is_none() && a.fixed_block.is_none() && a.dump_tokens.is_none() && a.runs == 1,
+            "--batch-tokens runs the standalone packed decode parity probe");
+        let max_lanes = MAX_PACKED_DECODE_WIDTH / a.packed_drafts.saturating_add(1);
+        anyhow::ensure!((2..=max_lanes).contains(&prompts.len()),
+            "--batch-tokens needs at least two prompts within the {MAX_PACKED_DECODE_WIDTH}-row verifier limit");
+        anyhow::ensure!(a.decode >= 2 && prompts.iter().all(|p| !p.is_empty() && p.len().saturating_add(a.decode).saturating_add(a.packed_drafts) <= a.max_seq),
+            "--batch-tokens needs nonempty prompts with room for output and the requested draft rows");
+    } else {
+        anyhow::ensure!(a.batch_logit_max_abs.is_none(), "--batch-logit-max-abs requires --batch-tokens");
+        anyhow::ensure!(a.packed_drafts == 0, "--packed-drafts requires --batch-tokens");
+        anyhow::ensure!(!a.prompt.is_empty(), "no prompt (use --tokens or --score)\nusage: {USAGE}");
+    }
     Ok(a)
 }
 
@@ -110,7 +135,8 @@ fn main() -> Result<()> {
                     let w = Loader { ck, cfg, rank: r, tp, tc: Default::default() }.load(&mut arena, cfg.n_layers, true)?;
                     let engram = engram.get()?.upload(&mut arena)?;
                     println!("rank {r}: weights {:.1} GB in {:.1}s", arena.bytes as f64 / 1e9, lt.elapsed().as_secs_f32());
-                    let mut rk = Rank::new(r, tp, cfg.clone(), dev, w, arena, args.max_seq, args.chunk, engram)?;
+                    let constructor = if args.batch_prompts.is_some() { Rank::new_packed } else { Rank::new };
+                    let mut rk = constructor(r, tp, cfg.clone(), dev, w, arena, args.max_seq, args.chunk, engram)?;
                     rk.set_sampling(args.seed)?;
                     peers.lock().unwrap()[r] = rk.comm.recv;
                     barrier.wait();
@@ -122,6 +148,9 @@ fn main() -> Result<()> {
                     }
                     barrier.wait();
 
+                    if let Some(prompts) = &args.batch_prompts {
+                        return batch_probe(&mut rk, prompts, args);
+                    }
                     let ptime = Instant::now();
                     let tok = rk.prefill(prompt, 0, args.chunk)?;
                     if let Some(cont) = &args.score {
@@ -199,6 +228,166 @@ fn main() -> Result<()> {
         Ok(())
     })?;
     Ok(())
+}
+
+fn batch_probe(rk: &mut Rank, prompts: &[Vec<i32>], args: &Args) -> Result<()> {
+    rk.set_packed_target_rows(prompts.len() * (1 + args.packed_drafts))?;
+    anyhow::ensure!(prompts.iter().flatten().all(|&token| (0..rk.cfg.vocab_size as i32).contains(&token)), "batch probe prompt token exceeds vocabulary");
+    if args.packed_drafts > 0 {
+        rk.validate_packed_spec(args.packed_drafts)?;
+    }
+    let mut first_tokens = Vec::with_capacity(prompts.len());
+    let mut reference_steps = Vec::with_capacity(prompts.len());
+    let mut isolated_elapsed = std::time::Duration::ZERO;
+    let verify_rows = args.packed_drafts + 1;
+    let mut reference_slot = rk.new_dense_reference_slot()?;
+    for (sequence, prompt) in prompts.iter().enumerate() {
+        let slot = &mut reference_slot;
+        let mut token = probe_prefill(rk, slot, prompt, args, sequence)?;
+        first_tokens.push(token);
+        let mut emitted = 1;
+        let mut steps = Vec::new();
+        let start = Instant::now();
+        while emitted < args.decode {
+            let input = DecodeToken { position: prompt.len() + emitted - 1, token };
+            rk.ensure_decode_slot(slot, input.position + verify_rows)?;
+            let result = probe_decode(rk, &mut [(slot, input)], args.packed_drafts)?.remove(0);
+            token = *result.tokens.last().expect("a decode step emits a token");
+            emitted += result.tokens.len();
+            steps.push(result);
+        }
+        isolated_elapsed += start.elapsed();
+        rk.release_decode_slot(slot)?;
+        reference_steps.push(steps);
+    }
+
+    drop(reference_slot);
+    let mut slots = (0..prompts.len()).map(|_| rk.new_decode_slot()).collect::<Result<Vec<_>>>()?;
+    for (sequence, (prompt, slot)) in prompts.iter().zip(&mut slots).enumerate() {
+        let first = probe_prefill(rk, slot, prompt, args, sequence)?;
+        anyhow::ensure!(first == first_tokens[sequence], "paged prefill diverged from the dense reference at lane {sequence}");
+    }
+    let mut anchors: Vec<_> = prompts.iter().zip(&first_tokens).map(|(prompt, &token)| DecodeToken {
+        position: prompt.len(), token,
+    }).collect();
+    let step_count = reference_steps.iter().map(Vec::len).max().unwrap();
+    let mut accepted = 0;
+    let mut steps = 0;
+    let mut emitted = 0;
+    let mut verifier_rows = 0;
+    let mut anchor_logits = Vec::new();
+    let mut packed_elapsed = std::time::Duration::ZERO;
+    let mut start = Instant::now();
+    for step in 0..step_count {
+        let mut lanes = Vec::new();
+        let mut sequences = Vec::new();
+        for (sequence, slot) in slots.iter_mut().enumerate() {
+            if step < reference_steps[sequence].len() {
+                let anchor = anchors[sequence];
+                rk.ensure_decode_slot(slot, anchor.position + verify_rows)?;
+                lanes.push((slot, anchor));
+                sequences.push(sequence);
+            }
+        }
+        if step % 2 == 1 {
+            lanes.reverse();
+            sequences.reverse();
+        }
+        let rotate = step % lanes.len();
+        lanes.rotate_left(rotate);
+        sequences.rotate_left(rotate);
+        verifier_rows += lanes.len() * verify_rows;
+        let generated = probe_decode(rk, &mut lanes, args.packed_drafts)?;
+        if step == 0 {
+            // Exclude this diagnostic D2H copy from packed decode timing. Step zero is
+            // in manifest order and row zero of each lane scores the teacher anchor.
+            packed_elapsed += start.elapsed();
+            let vocab_shard = rk.cfg.vocab_size / rk.tp;
+            let logits = rk.read_logits(lanes.len() * verify_rows)?;
+            anchor_logits = logits.chunks_exact(verify_rows * vocab_shard)
+                .map(|lane| lane[..vocab_shard].to_vec()).collect();
+            start = Instant::now();
+        }
+        for (sequence, output) in sequences.into_iter().zip(generated) {
+            anyhow::ensure!(output == reference_steps[sequence][step],
+                "packed decode diverged from isolated seeded decode at sequence {sequence}, step {step}");
+            anchors[sequence].position += output.tokens.len();
+            anchors[sequence].token = *output.tokens.last().expect("a decode step emits a token");
+            emitted += output.tokens.len();
+            accepted += output.accepted_drafts;
+            steps += 1;
+        }
+    }
+    packed_elapsed += start.elapsed();
+    for slot in &mut slots { rk.release_decode_slot(slot)?; }
+    if rk.rank == 0 {
+        println!("packed target graph ready = {}", rk.packed_target_graph_ready(args.packed_drafts > 0));
+        println!("packed width {}, {} drafts: {emitted} emitted tokens in {step_count} launches and {verifier_rows} verifier rows, 0 token mismatches, {:.2} useful tokens/launch, {:.2} accepted drafts per sequence step, {:.1} isolated tokens/s, {:.1} packed tokens/s",
+            prompts.len(), args.packed_drafts, emitted as f64 / step_count as f64, accepted as f64 / steps as f64,
+            emitted as f64 / isolated_elapsed.as_secs_f64(), emitted as f64 / packed_elapsed.as_secs_f64());
+    }
+    drop(slots);
+    compare_incumbent_logits(rk, args, prompts, &first_tokens, &anchor_logits)
+}
+
+fn compare_incumbent_logits(
+    rk: &mut Rank,
+    args: &Args,
+    prompts: &[Vec<i32>],
+    anchors: &[i32],
+    packed_logits: &[Vec<f32>],
+) -> Result<()> {
+    anyhow::ensure!(prompts.len() == anchors.len() && anchors.len() == packed_logits.len());
+    let mut dense_slot = rk.new_dense_reference_slot()?;
+    let (mut max_abs, mut squared, mut count, mut nonfinite) = (0f64, 0f64, 0usize, 0usize);
+    let mut worst = (0usize, 0usize);
+    for (sequence, ((prompt, &anchor), packed)) in prompts.iter().zip(anchors).zip(packed_logits).enumerate() {
+        probe_prefill(rk, &mut dense_slot, prompt, args, sequence)?;
+        rk.ensure_decode_slot(&mut dense_slot, prompt.len() + 1)?;
+        let dense = rk.with_decode_slot(&mut dense_slot, |rank| {
+            let mut meta = Meta { pos: prompt.len() as i32, m: 1, ..Default::default() };
+            meta.tokens[0] = anchor;
+            rank.set_meta(&meta)?;
+            rank.forward(1, rank.cfg.n_layers, None)?;
+            rank.read_logits(1)
+        })?;
+        rk.release_decode_slot(&mut dense_slot)?;
+        anyhow::ensure!(dense.len() == packed.len(), "teacher-forced vocabulary shard differs");
+        for (id, (&reference, &candidate)) in dense.iter().zip(packed).enumerate() {
+            let error = (f64::from(reference) - f64::from(candidate)).abs();
+            if !error.is_finite() { nonfinite += 1; continue; }
+            if error > max_abs {
+                max_abs = error;
+                worst = (sequence, rk.rank * dense.len() + id);
+            }
+            squared += error * error;
+            count += 1;
+        }
+    }
+    let rms = (squared / count.max(1) as f64).sqrt();
+    println!("teacher-forced incumbent comparison rank {}: {count} finite logits, {nonfinite} nonfinite, max_abs {max_abs:.7}, rms {rms:.7}, worst sequence {} token {}", rk.rank, worst.0, worst.1);
+    anyhow::ensure!(nonfinite == 0, "nonfinite teacher-forced logit difference on rank {}", rk.rank);
+    if let Some(limit) = args.batch_logit_max_abs {
+        anyhow::ensure!(max_abs <= f64::from(limit), "teacher-forced logit difference {max_abs} exceeds {limit} on rank {}", rk.rank);
+    }
+    Ok(())
+}
+
+fn probe_prefill(rk: &mut Rank, slot: &mut DecodeSlot, prompt: &[i32], args: &Args, sequence: usize) -> Result<i32> {
+    let seed = args.seed.wrapping_add(sequence as u64);
+    rk.ensure_decode_slot(slot, prompt.len())?;
+    rk.with_decode_slot(slot, |rank| {
+        rank.set_sampling(seed)?;
+        rank.prefill(prompt, 0, args.chunk)
+    })
+}
+
+fn probe_decode(rk: &mut Rank, lanes: &mut [(&mut DecodeSlot, DecodeToken)], drafts: usize) -> Result<Vec<SpecDecoded>> {
+    if drafts > 0 {
+        rk.spec_decode_batch(lanes, drafts)
+    } else {
+        Ok(rk.decode_batch(lanes)?.into_iter().map(|token| SpecDecoded { tokens: vec![token], accepted_drafts: 0 }).collect())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

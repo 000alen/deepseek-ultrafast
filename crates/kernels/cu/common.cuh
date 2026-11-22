@@ -2,6 +2,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <stddef.h>
 #include <stdint.h>
 
 typedef __nv_bfloat16 bf16;
@@ -10,6 +11,12 @@ typedef __nv_bfloat16 bf16;
 
 #define COMM_MIN_CTAS_PER_SM 18
 #define GEMV_MIN_CTAS_PER_SM(PH) 2
+
+// Only physical storage wraps. Rotary tables, masks, and group boundaries use logical rows.
+DEV uint32_t cache_row(int logical, int ring_rows) {
+    const uint32_t row = (uint32_t)logical;
+    return ring_rows ? row % (uint32_t)ring_rows : row;
+}
 
 DEV void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
 DEV void pdl_launch() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }

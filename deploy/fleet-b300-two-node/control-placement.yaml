@@ -1,0 +1,9 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dsuf-gateway
+spec:
+  template:
+    spec:
+      nodeSelector:
+        deepseek-ultrafast/node-role: control

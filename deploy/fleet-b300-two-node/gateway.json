@@ -1,0 +1,46 @@
+{
+  "listen": "0.0.0.0:8080",
+  "max_active": 256,
+  "max_pending": 128,
+  "standard_max_output_tokens": 8192,
+  "tenants": [
+    {
+      "id": "coding",
+      "token_env": "DSUF_CODING_TOKEN",
+      "max_active": 256,
+      "max_pending": 128,
+      "max_buffered_bytes": 536870912,
+      "max_reserved_output_tokens": 2097152
+    }
+  ],
+  "backends": [
+    {
+      "id": "standard-0",
+      "url": "http://dsuf-standard-0.dsuf-standard:8000",
+      "pool": "standard",
+      "cohort": "dsuf-packed-ar-tp4-128k-wide32",
+      "max_inflight": 64
+    },
+    {
+      "id": "standard-1",
+      "url": "http://dsuf-standard-1.dsuf-standard:8000",
+      "pool": "standard",
+      "cohort": "dsuf-packed-ar-tp4-128k-wide32",
+      "max_inflight": 64
+    },
+    {
+      "id": "standard-2",
+      "url": "http://dsuf-standard-2.dsuf-standard:8000",
+      "pool": "standard",
+      "cohort": "dsuf-packed-ar-tp4-128k-wide32",
+      "max_inflight": 64
+    },
+    {
+      "id": "standard-3",
+      "url": "http://dsuf-standard-3.dsuf-standard:8000",
+      "pool": "standard",
+      "cohort": "dsuf-packed-ar-tp4-128k-wide32",
+      "max_inflight": 64
+    }
+  ]
+}

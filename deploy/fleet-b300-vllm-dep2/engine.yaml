@@ -1,0 +1,103 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dsuf-standard
+spec:
+  template:
+    spec:
+      containers:
+        - name: serve
+          # InferenceX B300 DEP2 AgentX image from SemiAnalysisAI/InferenceX#4332.
+          image: vllm/vllm-openai:cu134-nightly-x86_64-dev-20261019-mk@sha256:2b9fc4b18d0aaabe4d5cad020d9270106472ebe65f5d3bc02c50526b8d9fd280
+          command: ["vllm", "serve"]
+          args:
+            - /models
+            - --served-model-name
+            - deepseek-v4.1-flash
+            - --host
+            - 0.0.0.0
+            - --port
+            - '8000'
+            - --tensor-parallel-size
+            - '1'
+            - --data-parallel-size
+            - $(DSUF_DP_SIZE)
+            - --enable-expert-parallel
+            - --language-model-only
+            - --tokenizer-mode
+            - deepseek_v41
+            - --reasoning-parser
+            - deepseek_v41
+            - --tool-call-parser
+            - deepseek_v41
+            - --enable-auto-tool-choice
+            - --enable-prompt-tokens-details
+            - --enable-prefix-caching
+            - --enable-chunked-prefill
+            - --max-model-len
+            - '131072'
+            - --max-num-seqs
+            - $(DSUF_MAX_SEQS_PER_RANK)
+            - --max-num-batched-tokens
+            - $(DSUF_MAX_BATCHED_TOKENS)
+            - --prefill-schedule-interval
+            - $(DSUF_PREFILL_INTERVAL)
+            - --kv-cache-dtype
+            - fp8
+            - --engram-config
+            - $(DSUF_ENGRAM_CONFIG)
+            - --kernel-config
+            - '{"enable_flashinfer_autotune":true,"moe_backend":"deep_gemm_mega_moe"}'
+            - --attention-config
+            - $(DSUF_ATTENTION_CONFIG)
+            - --speculative-config
+            - '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":false}'
+            - --max-cudagraph-capture-size
+            - '8190'
+            - --compilation-config
+            - '{"mode":"VLLM_COMPILE","cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[6,12,18,24,30,36,48,60,72,96,120,144,192,240,288,384,480,576,768,1020,1536,2046,3072,4092,6144,8190],"decoder_replay_cudagraph_capture_sizes":[6,12,18,24,30,36,48,60,72,96,120,144,192,240,288,384,480,576,768,1020,1536,2048,2304,2560,2816,3072,3328,3584,4096]}'
+          env:
+            - name: DSUF_KV_HOST
+              $patch: delete
+            - name: DSUF_REDIS_URL
+              $patch: delete
+            - name: VLLM_USE_V2_MODEL_RUNNER
+              value: '1'
+            - name: VLLM_USE_RUST_FRONTEND
+              value: '1'
+            - name: VLLM_ENGINE_READY_TIMEOUT_S
+              value: '7200'
+            - name: DSUF_DP_SIZE
+              value: '2'
+            - name: DSUF_MAX_SEQS_PER_RANK
+              value: '64'
+            - name: DSUF_MAX_BATCHED_TOKENS
+              value: '32768'
+            - name: DSUF_PREFILL_INTERVAL
+              value: '56'
+            - name: DSUF_ENGRAM_CONFIG
+              value: '{"cpu_offload":true,"embedding_across_dp":true}'
+            - name: DSUF_ATTENTION_CONFIG
+              value: '{"backend":"FLASHINFER_MLA_SPARSE_DSV41","indexer_kv_dtype":"mxfp4","indexer_sparse_logits":true}'
+          ports:
+            - containerPort: 19500
+              $patch: delete
+          resources:
+            requests:
+              memory: 384Gi
+            limits:
+              memory: 384Gi
+              nvidia.com/gpu: 2
+              rdma/hca: null
+          startupProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 10
+            failureThreshold: 780
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: shm
+          emptyDir: {medium: Memory, sizeLimit: 256Gi}

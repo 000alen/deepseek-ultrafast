@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dsuf-long
+$patch: delete
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dsuf-long
+$patch: delete
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dsuf-redis
+$patch: delete
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dsuf-redis
+$patch: delete
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: dsuf-redis-private
+$patch: delete

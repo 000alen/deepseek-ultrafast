@@ -1,0 +1,22 @@
+FROM ubuntu:24.04 AS build
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
+ENV PATH=/usr/local/cargo/bin:$PATH
+WORKDIR /src
+COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+RUN rustup toolchain install
+COPY crates crates
+RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git --mount=type=cache,id=deepseek-ultrafast-gateway-target,target=/src/target \
+    cargo build --locked --release -p deepseek-ultrafast-gateway && \
+    cp target/release/deepseek-ultrafast-gateway /usr/local/bin/
+
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /usr/local/bin/deepseek-ultrafast-gateway /usr/local/bin/
+USER 65532:65532
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/deepseek-ultrafast-gateway"]
+CMD ["/etc/dsuf/gateway.json"]

@@ -1,10 +1,12 @@
-#include "common.cuh"
+#include "attn_params.cuh"
 
 struct Meta {
     int pos;
     int m;
     int tokens[16];
 };
+
+#include "packed_rows.cuh"
 
 DEV float bf(bf16 v) { return __bfloat162float(v); }
 DEV bf16 tobf(float v) { return __float2bfloat16(v); }
@@ -41,16 +43,19 @@ struct IdxParams {
     int bf16_ref;
 };
 
-extern "C" __global__ void __launch_bounds__(128) idx_score(const Meta* meta, const IdxParams p) {
+DEV void idx_score_body(const Meta* meta, const PackedRow* rows, int layer, bool filter, IdxParams p) {
     __shared__ __align__(16) bf16 qs[32][136];
     __shared__ __align__(16) bf16 ks[128][136];
     __shared__ float ws[32];
     pdl_wait();
     pdl_launch();
     const int m = blockIdx.y;
-    if (m >= meta->m) return;
-    const int T = (meta->pos + m + 1) / p.ratio;
-    const int tmax = (meta->pos + meta->m) / p.ratio;
+    if (rows ? !rows[m].meta : m >= meta->m) return;
+    const int T = ((rows ? rows[m].position : meta->pos + m) + 1) / p.ratio;
+    const int tmax = rows ? T : (meta->pos + meta->m) / p.ratio;
+    if (rows) p.kc = rows[m].layers[layer].keys;
+    const uint8_t* mask = rows ? (filter ? rows[m].candidate_mask : nullptr)
+                               : (p.cand ? p.cand + (size_t)m * p.ld_cand : nullptr);
     if ((int)blockIdx.x * 128 >= tmax) return;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     for (int i = tid; i < 32 * 16; i += 128) {
@@ -59,6 +64,13 @@ extern "C" __global__ void __launch_bounds__(128) idx_score(const Meta* meta, co
     }
     if (tid < 32) ws[tid] = bf(p.w[(size_t)m * p.ldw + tid]);
     for (int t0 = blockIdx.x * 128; t0 < tmax; t0 += gridDim.x * 128) {
+    if (rows && mask) {
+        const int key = t0 + tid;
+        if (!__syncthreads_or(key < T && mask[key / p.cand_block])) {
+            if (key < tmax) p.scores[(size_t)m * p.ld + key] = -INFINITY;
+            continue;
+        }
+    }
     __syncthreads();
     for (int i = tid; i < 128 * 16; i += 128) {
         const int r = i / 16, c = (i % 16) * 8;
@@ -119,7 +131,7 @@ extern "C" __global__ void __launch_bounds__(128) idx_score(const Meta* meta, co
                 const int pp = pos0 + i;
                 if (pp >= tmax) continue;
                 bool ok = pp < T;
-                if (ok && p.cand) ok = p.cand[(size_t)m * p.ld_cand + pp / p.cand_block] != 0;
+                if (ok && mask) ok = mask[pp / p.cand_block] != 0;
                 p.scores[(size_t)m * p.ld + pp] = ok ? v[i] : -INFINITY;
             }
         }
@@ -127,13 +139,21 @@ extern "C" __global__ void __launch_bounds__(128) idx_score(const Meta* meta, co
     }
 }
 
-extern "C" __global__ void block_max(const Meta* meta, const float* scores, int ld, int ratio, int bs, float* out,
+extern "C" __global__ void __launch_bounds__(128) idx_score(const Meta* meta, const IdxParams p) {
+    idx_score_body(meta, nullptr, 0, false, p);
+}
+extern "C" __global__ void __launch_bounds__(128) packed_idx_score(
+    const PackedRow* rows, int layer, const IdxParams p, int filter) {
+    idx_score_body(nullptr, rows, layer, filter != 0, p);
+}
+
+DEV void block_max_body(const Meta* meta, const PackedRow* rows, const float* scores, int ld, int ratio, int bs, float* out,
                                      int ldo) {
     pdl_wait();
     pdl_launch();
     const int m = blockIdx.y;
-    if (m >= meta->m) return;
-    const int T = (meta->pos + m + 1) / ratio;
+    if (rows ? !rows[m].meta : m >= meta->m) return;
+    const int T = ((rows ? rows[m].position : meta->pos + m) + 1) / ratio;
     const int nb = (T + bs - 1) / bs;
     for (int b = blockIdx.x * blockDim.x + threadIdx.x; b < nb; b += gridDim.x * blockDim.x) {
         float mx = -INFINITY;
@@ -141,6 +161,13 @@ extern "C" __global__ void block_max(const Meta* meta, const float* scores, int 
         if (b == (T - 1) / bs) mx = INFINITY;
         out[(size_t)m * ldo + b] = mx;
     }
+}
+
+extern "C" __global__ void block_max(const Meta* meta, const float* scores, int ld, int ratio, int bs, float* out, int ldo) {
+    block_max_body(meta, nullptr, scores, ld, ratio, bs, out, ldo);
+}
+extern "C" __global__ void packed_block_max(const PackedRow* rows, const float* scores, int ld, int ratio, int bs, float* out, int ldo) {
+    block_max_body(nullptr, rows, scores, ld, ratio, bs, out, ldo);
 }
 
 DEV uint32_t fkey(float f) {
@@ -251,15 +278,23 @@ extern "C" __global__ void __launch_bounds__(1024) topk_select(const Meta* meta,
     topk_select_row(p, m, n);
 }
 
-extern "C" __global__ void __launch_bounds__(128) compress_pool(const Meta* meta, const float* kvh,
+DEV void compress_pool_body(const Meta* meta, const PackedRow* rows, int layer, const float* kvh,
                                                                const float* sch, int ratio, const bf16* w, float eps,
-                                                               bf16* latent, int dim) {
+                                                               bf16* latent, int dim, int ring_rows) {
     __shared__ float sh[4];
     __shared__ bf16 tmp[512];
     constexpr int RMAX = 4, DPT = 4;
     const int m = blockIdx.x;
-    const int pos0 = meta->pos, pos = pos0 + m;
-    const bool act = m < meta->m && (pos + 1) % ratio == 0;
+    if (rows && !rows[m].meta) return;
+    const int pos = rows ? rows[m].position : meta->pos + m;
+    const int pos0 = rows ? pos - rows[m].local : meta->pos;
+    const bool act = (rows || m < meta->m) && (pos + 1) % ratio == 0;
+    if (rows) {
+        const PackedLayer cache = rows[m].layers[layer];
+        kvh = cache.kv_history;
+        sch = cache.score_history;
+        ring_rows = cache.history_rows;
+    }
     const int g0 = pos + 1 - ratio;
     float sv[DPT][RMAX], kv[DPT][RMAX], wv[DPT];
 #pragma unroll
@@ -269,8 +304,8 @@ extern "C" __global__ void __launch_bounds__(128) compress_pool(const Meta* meta
 #pragma unroll
         for (int i = 0; i < RMAX; ++i) {
             const bool on = act && d < dim && i < ratio && g0 + i < pos0;
-            sv[k][i] = on ? sch[(size_t)(g0 + i) * dim + d] : -INFINITY;
-            kv[k][i] = on ? kvh[(size_t)(g0 + i) * dim + d] : 0.f;
+            sv[k][i] = on ? sch[(size_t)cache_row(g0 + i, ring_rows) * dim + d] : -INFINITY;
+            kv[k][i] = on ? kvh[(size_t)cache_row(g0 + i, ring_rows) * dim + d] : 0.f;
         }
     }
     pdl_wait();
@@ -282,8 +317,8 @@ extern "C" __global__ void __launch_bounds__(128) compress_pool(const Meta* meta
         for (int i = 0; i < RMAX; ++i) {
             const int d = threadIdx.x + k * 128;
             if (d < dim && i < ratio && g0 + i >= pos0) {
-                sv[k][i] = sch[(size_t)(g0 + i) * dim + d];
-                kv[k][i] = kvh[(size_t)(g0 + i) * dim + d];
+                sv[k][i] = sch[(size_t)cache_row(g0 + i, ring_rows) * dim + d];
+                kv[k][i] = kvh[(size_t)cache_row(g0 + i, ring_rows) * dim + d];
             }
         }
     float ss = 0.f;
@@ -319,32 +354,59 @@ extern "C" __global__ void __launch_bounds__(128) compress_pool(const Meta* meta
     }
 }
 
-extern "C" __global__ void store_hist_f32(const Meta* meta, const float* src, int ld, float* hist, int n) {
+extern "C" __global__ void __launch_bounds__(128) compress_pool(const Meta* meta, const float* kvh, const float* sch,
+    int ratio, const bf16* w, float eps, bf16* latent, int dim, int ring_rows) {
+    compress_pool_body(meta, nullptr, 0, kvh, sch, ratio, w, eps, latent, dim, ring_rows);
+}
+extern "C" __global__ void __launch_bounds__(128) packed_compress_pool(const PackedRow* rows, int layer,
+    int ratio, const bf16* w, float eps, bf16* latent, int dim) {
+    compress_pool_body(nullptr, rows, layer, nullptr, nullptr, ratio, w, eps, latent, dim, 0);
+}
+
+extern "C" __global__ void packed_store_hist(const PackedRow* rows, int layer,
+    const float* kv, const float* scores, int dim) {
+    pdl_wait();
+    pdl_launch();
+    const int m = blockIdx.x;
+    const PackedRow row = rows[m];
+    if (!row.meta) return;
+    const PackedLayer cache = row.layers[layer];
+    const size_t dest = (size_t)cache_row(row.position, cache.history_rows) * dim;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        cache.kv_history[dest + d] = kv[(size_t)m * dim + d];
+        cache.score_history[dest + d] = scores[(size_t)m * dim + d];
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(1024) packed_topk(const PackedRow* rows, const TopkParams common) {
+    pdl_wait();
+    pdl_launch();
+    const int m = blockIdx.x;
+    const PackedRow row = rows[m];
+    if (!row.meta) return;
+    TopkParams p = common;
+    p.x += (size_t)m * p.ld;
+    int n = (row.position + 1) / p.ratio;
+    if (p.drop_neg_inf) {
+        n = (n + p.block - 1) / p.block;
+        p.out = row.candidate_ids;
+        p.mask = row.candidate_mask;
+        for (int i = threadIdx.x; i < p.ld_mask; i += blockDim.x) p.mask[i] = 0;
+        __syncthreads();
+    } else {
+        p.out += (size_t)m * p.k;
+    }
+    topk_select_row(p, 0, n);
+}
+
+extern "C" __global__ void store_hist_f32(const Meta* meta, const float* src, int ld, float* hist, int n, int ring_rows) {
     pdl_wait();
     pdl_launch();
     const int m = blockIdx.y;
     if (m >= meta->m) return;
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) hist[(size_t)(meta->pos + m) * n + i] = src[(size_t)m * ld + i];
+    if (i < n) hist[(size_t)cache_row(meta->pos + m, ring_rows) * n + i] = src[(size_t)m * ld + i];
 }
-
-struct AttnFParams {
-    const bf16* q;
-    const bf16* win;
-    const bf16* comp;
-    const int* topk;
-    int ktop;
-    float scale;
-    const float* sink;
-    bf16* out;
-    const float* cos;
-    const float* sin;
-    int R;
-    int fixed_window;
-    int nh;
-    int pre;
-    int win_floor;
-};
 
 DEV uint32_t cl_rank_a() { uint32_t r; asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(r)); return r; }
 DEV uint32_t cl_size_a() { uint32_t r; asm volatile("mov.u32 %0, %%cluster_nctarank;" : "=r"(r)); return r; }
@@ -356,7 +418,7 @@ DEV void bulk_g2s(void* dst, const void* src, uint32_t bytes, uint64_t* bar) {
                  : "memory");
 }
 
-DEV void attn_fused_body(const Meta* meta, const AttnFParams& p) {
+DEV void attn_fused_body(const Meta* meta, int local, const AttnFParams& p) {
     extern __shared__ __align__(16) uint8_t smem[];
     const int R = p.R;
     const int hg = blockIdx.z * AH, nh = min(AH, p.nh - hg), nhs = p.nh;
@@ -379,7 +441,7 @@ DEV void attn_fused_body(const Meta* meta, const AttnFParams& p) {
         asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(sm_addr(&rbar)), "r"(bytes) : "memory");
     }
     asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-    const int m = blockIdx.y;
+    const int activation_row = blockIdx.y;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int s0 = cr * R;
     const int nslots = 128 + p.ktop;
@@ -393,19 +455,19 @@ DEV void attn_fused_body(const Meta* meta, const AttnFParams& p) {
     }
     __syncthreads();
     const int pos0 = meta->pos, Mm = meta->m;
-    const bool live = m < Mm;
+    const bool live = local < Mm;
     {
-        const int pos = pos0 + m, wend = p.fixed_window ? pos0 - 1 : pos;
+        const int pos = pos0 + local, wend = p.fixed_window ? pos0 - 1 : pos;
         auto early_row = [&](int i) -> const bf16* {
             const int s = s0 + i;
             if (s < 128) {
                 const int ps_ = wend - 127 + s;
                 if (ps_ < p.win_floor) return nullptr;
-                return ((p.pre & 1) && ps_ < pos0) ? p.win + (size_t)ps_ * AD : (const bf16*)1;
+                return ((p.pre & 1) && ps_ < pos0) ? p.win + (size_t)cache_row(ps_, p.ring_rows) * AD : (const bf16*)1;
             }
             if (s >= nslots) return nullptr;
             if (!(p.pre & 2)) return (const bf16*)1;
-            const int j = p.topk[m * p.ktop + (s - 128)];
+            const int j = p.topk[activation_row * p.ktop + (s - 128)];
             return j >= 0 ? p.comp + (size_t)j * AD : nullptr;
         };
         for (int i = tid; i < R; i += 128) {
@@ -431,14 +493,14 @@ DEV void attn_fused_body(const Meta* meta, const AttnFParams& p) {
         asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
         return;
     }
-    const int pos = pos0 + m;
+    const int pos = pos0 + local;
     const int wend = p.fixed_window ? pos0 - 1 : pos;
     for (int i = tid; i < R; i += 128) {
         if (valid[i] != -1) continue;
         const int s = s0 + i;
         const bf16* row = nullptr;
-        if (s < 128) { if (wend - 127 + s >= p.win_floor) row = p.win + (size_t)(wend - 127 + s) * AD; }
-        else if (s < nslots) { const int j = p.topk[m * p.ktop + (s - 128)]; if (j >= 0) row = p.comp + (size_t)j * AD; }
+        if (s < 128) { if (wend - 127 + s >= p.win_floor) row = p.win + (size_t)cache_row(wend - 127 + s, p.ring_rows) * AD; }
+        else if (s < nslots) { const int j = p.topk[activation_row * p.ktop + (s - 128)]; if (j >= 0) row = p.comp + (size_t)j * AD; }
         valid[i] = row != nullptr ? 2 : 0;
         if (row) atomicAdd(&nvalid, 1);
         else for (int c = 0; c < AD; c += 8) *(uint4*)(kv + i * ALD + c) = make_uint4(0, 0, 0, 0);
@@ -447,13 +509,13 @@ DEV void attn_fused_body(const Meta* meta, const AttnFParams& p) {
     if (tid == 0) {
         const uint32_t bytes = (uint32_t)nvalid * AD * 2 + nh * AD * 2;
         asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(sm_addr(&bar)), "r"(bytes) : "memory");
-        for (int h = 0; h < nh; ++h) bulk_g2s(qs + h * ALD, p.q + ((size_t)m * nhs + hg + h) * AD, AD * 2, &bar);
+        for (int h = 0; h < nh; ++h) bulk_g2s(qs + h * ALD, p.q + ((size_t)activation_row * nhs + hg + h) * AD, AD * 2, &bar);
     }
     __syncthreads();
     for (int i = tid; i < R; i += 128) {
         if (valid[i] != 2) continue;
         const int s = s0 + i;
-        const bf16* row = s < 128 ? p.win + (size_t)(wend - 127 + s) * AD : p.comp + (size_t)p.topk[m * p.ktop + (s - 128)] * AD;
+        const bf16* row = s < 128 ? p.win + (size_t)cache_row(wend - 127 + s, p.ring_rows) * AD : p.comp + (size_t)p.topk[activation_row * p.ktop + (s - 128)] * AD;
         bulk_g2s(kv + i * ALD, row, AD * 2, &bar);
     }
     asm volatile("{ .reg .pred P; W_%=: mbarrier.try_wait.parity.shared::cta.b64 P, [%0], 0; @!P bra W_%=; }" ::"r"(sm_addr(&bar)) : "memory");
@@ -573,12 +635,34 @@ DEV void attn_fused_body(const Meta* meta, const AttnFParams& p) {
                 a[k] = x0; a[k + 1] = x1;
             }
         }
-        bf16* o = p.out + ((size_t)m * nhs + hg + h) * AD + d;
+        bf16* o = p.out + ((size_t)activation_row * nhs + hg + h) * AD + d;
         for (int k = 0; k < 4; ++k) o[k] = tobf(a[k]);
     }
 }
-extern "C" __global__ void __launch_bounds__(128) attn_fused(const Meta* meta, const __grid_constant__ AttnFParams p) { attn_fused_body(meta, p); }
-extern "C" __global__ void __launch_bounds__(128) attn_fused_hg(const Meta* meta, const __grid_constant__ AttnFParams p) { attn_fused_body(meta, p); }
+extern "C" __global__ void __launch_bounds__(128) attn_fused(const Meta* meta, const __grid_constant__ AttnFParams p) { attn_fused_body(meta, blockIdx.y, p); }
+extern "C" __global__ void __launch_bounds__(128) attn_fused_hg(const Meta* meta, const __grid_constant__ AttnFParams p) { attn_fused_body(meta, blockIdx.y, p); }
+extern "C" __global__ void __launch_bounds__(128) attn_packed(
+    const PackedRow* rows, int layer, const __grid_constant__ AttnFParams common) {
+    const PackedRow row = rows[blockIdx.y];
+    if (!row.meta) {
+        pdl_wait();
+        pdl_launch();
+        if (blockIdx.x == 0) {
+            const int first_head = blockIdx.z * AH;
+            const int count = min(AH, common.nh - first_head) * AD;
+            bf16* out = common.out + ((size_t)blockIdx.y * common.nh + first_head) * AD;
+            for (int d = threadIdx.x; d < count; d += blockDim.x) out[d] = tobf(0.f);
+        }
+        return;
+    }
+    const PackedLayer cache = row.layers[layer];
+    AttnFParams p = common;
+    p.win = cache.window;
+    p.comp = cache.compressed;
+    p.ring_rows = cache.ring_rows;
+    attn_fused_body(row.meta, row.local, p);
+}
+
 
 DEV void cp_async16(void* dst, const void* src, bool ok) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(sm_addr(dst)), "l"(src), "r"(ok ? 16 : 0) : "memory");
@@ -615,7 +699,7 @@ DEV void attn_prefill_body(const Meta* meta, const AttnFParams& p) {
         const bf16* rp = nullptr;
         if (lane < RW) {
             const int s = c * PC + warp * RW + lane;
-            if (s < 128) { if (wend - 127 + s >= p.win_floor) rp = p.win + (size_t)(wend - 127 + s) * AD; }
+            if (s < 128) { if (wend - 127 + s >= p.win_floor) rp = p.win + (size_t)cache_row(wend - 127 + s, p.ring_rows) * AD; }
             else if (s < nslots) { const int j = tk_s[s - 128]; if (j >= 0) rp = p.comp + (size_t)j * AD; }
             valid[b][warp * RW + lane] = rp != nullptr;
         }

@@ -21,13 +21,19 @@ impl Options {
     pub fn new(engine: &crate::engine::EngineArgs) -> Result<Self> {
         let bind = deepseek_ultrafast_kv_transfer::kv_address()?;
         let tg2 = deepseek_ultrafast_cuda::profile::sm103();
-        let profile = format!(
+        let mut profile = format!(
             "deepseek-ultrafast-kv-snapshot-v3-image-v2\0tp={}\0max_seq={}\0config={}\0tokenizer={}\0tcgemv2={}",
             engine.gpus.len(), engine.max_seq,
             digest(&std::fs::read(engine.ckpt.join("inference/config.json"))?),
             digest(&std::fs::read(engine.ckpt.join("tokenizer.json"))?),
             tg2 as u8,
         );
+        if engine.batch.enabled() {
+            profile.push_str(&format!(
+                "\0execution=packed-vmm-v3\0target_rows={}\0drafts={}",
+                engine.batch.target_decode_rows(), engine.batch.drafts,
+            ));
+        }
         Ok(Self {
             profile,
             config: Config {
@@ -42,7 +48,9 @@ impl Options {
                 timeout: Duration::from_secs(30),
                 token_text: None,
             },
-            memory: Settings,
+            memory: Settings {
+                resident_candidate_leases: engine.batch.resident_candidate_leases(),
+            },
         })
     }
 
@@ -58,7 +66,7 @@ impl Options {
     pub async fn start(&self, raw_image_max: usize) -> Result<PeerCache> {
         let available = host_budget::sample()?;
         let budget = self.memory.resolve(available.effective, raw_image_max)?;
-        deepseek_ultrafast_logging::diagnostic!("KV host budget after ALL-rank CUDA graph warmup: host_available={} effective_available={} fraction={} gross={} payload_lru={} max_snapshot={} registered_limit={} heap_slack={} fp4={} cgroup_limits={:?}",
+        deepseek_ultrafast_logging::diagnostic!("KV host budget after rank model load: host_available={} effective_available={} fraction={} gross={} payload_lru={} max_snapshot={} registered_limit={} heap_slack={} fp4={} cgroup_limits={:?}",
             available.host, available.effective, Settings::FRACTION, budget.gross, budget.cache,
             budget.snapshot, budget.registered, budget.heap_slack, true, available.limits);
         let mut config = self.config.clone();

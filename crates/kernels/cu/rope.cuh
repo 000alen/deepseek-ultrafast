@@ -25,12 +25,14 @@ struct RopeParams {
     int ratio;
     bf16* dst;
     int pos_offset;
+    int ring_rows;
     const bf16* norm_w;
     float norm_eps;
     int dst_by_row;
     uint8_t* q4;
     uint8_t* sf4;
 };
+static_assert(sizeof(RopeParams) == 104 && offsetof(RopeParams, ring_rows) == 68);
 
 DEV void rope_body(const int* meta, const RopeParams& p, int row_, int lt, int grp) {
     pdl_wait();
@@ -45,6 +47,7 @@ DEV void rope_body(const int* meta, const RopeParams& p, int row_, int lt, int g
         cidx = pos / p.ratio;
         pos = cidx * p.ratio;
     }
+    const uint32_t dst_row = p.dst_by_row ? m : cache_row(cidx, p.ring_rows);
     bf16* xr = p.x + (size_t)row * p.ldx;
     const int e0 = lt * 8;
     float v[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
@@ -106,7 +109,7 @@ DEV void rope_body(const int* meta, const RopeParams& p, int row_, int lt, int g
                 s = __half2float(__ushort_as_half((unsigned short)(h & 0xffff)));
             }
             if (p.q4 && p.quant == Q_FP4_E8M0 && e0 < p.n) {
-                const size_t r4 = p.dst ? (size_t)(p.dst_by_row ? m : cidx) * p.rows_per_token + head : (size_t)row;
+                const size_t r4 = p.dst ? (size_t)dst_row * p.rows_per_token + head : (size_t)row;
                 uint32_t pk = 0;
 #pragma unroll
                 for (int i = 0; i < 8; i += 2) {
@@ -127,6 +130,9 @@ DEV void rope_body(const int* meta, const RopeParams& p, int row_, int lt, int g
         bf16* hb = (bf16*)&q;
         for (int i = 0; i < 8; ++i) hb[i] = rp_tobf(v[i]);
         *(uint4*)(xr + e0) = q;
-        if (p.dst) *(uint4*)(p.dst + ((size_t)(p.dst_by_row ? m : cidx) * p.rows_per_token + head) * p.n + e0) = q;
+        // A bulk MTP append may span the physical window more than once.
+        // Only the newest logical writer for each slot may publish its row.
+        if (p.dst && (!p.ring_rows || p.dst_by_row || meta[1] - 1 - m < p.ring_rows * max(1, p.ratio)))
+            *(uint4*)(p.dst + ((size_t)dst_row * p.rows_per_token + head) * p.n + e0) = q;
     }
 }

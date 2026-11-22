@@ -83,3 +83,79 @@ fn cancellation_prunes_pending_ready_and_completed_transfers_once() {
     assert_eq!(*discarded_ready.lock().unwrap(), [2]);
     assert_eq!(*discarded_fetching.lock().unwrap(), [3]);
 }
+
+#[test]
+fn preparation_skips_blocked_sessions_and_polling_stays_nonblocking() {
+    let q = Queue::default();
+    q.push(job(1));
+    q.push(job(2));
+    assert!(q.try_pop().is_none());
+
+    let unrelated = q.prepare_if(|job| job.id != 1).unwrap();
+    assert_eq!(unrelated.id, 2);
+    q.prepared(unrelated, 2);
+    assert_eq!(q.try_pop().unwrap().0.id, 2);
+    assert!(q.try_pop().is_none());
+
+    let formerly_blocked = q.prepare().unwrap();
+    assert_eq!(formerly_blocked.id, 1);
+    q.prepared(formerly_blocked, 1);
+    q.close();
+    assert_eq!(next(&q), 1);
+    assert!(q.pop().is_none());
+}
+
+#[test]
+fn unrelated_preparation_can_finish_while_an_earlier_job_is_in_flight() {
+    let q = Queue::default();
+    q.push(job(1));
+    q.push(job(2));
+    let slow = q.prepare().unwrap();
+    q.close();
+    std::thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_queue = &q;
+        scope.spawn(move || {
+            if let Some(fast) = worker_queue.prepare() {
+                let id = fast.id;
+                worker_queue.prepared(fast, id);
+                tx.send(id).unwrap();
+            }
+        });
+        // Release the first job before checking the assertion so a regression
+        // to serialized preparation cannot strand the scoped worker.
+        let fast = rx.recv_timeout(std::time::Duration::from_secs(1));
+        q.prepared(slow, 1);
+        assert_eq!(fast.unwrap(), 2);
+    });
+    assert_eq!([next(&q), next(&q)], [2, 1]);
+    assert!(q.pop().is_none());
+}
+
+#[test]
+fn in_flight_and_ready_jobs_share_the_preparation_budget() {
+    let q = Queue::default();
+    for id in 1..MAX_PREPARED_REQUESTS {
+        ready(&q, id);
+    }
+    q.push(job(0));
+    let slow = q.prepare().unwrap();
+    q.push(job(MAX_PREPARED_REQUESTS));
+    q.close();
+    std::thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_queue = &q;
+        scope.spawn(move || {
+            let extra = worker_queue.prepare().unwrap();
+            let id = extra.id;
+            worker_queue.prepared(extra, id);
+            tx.send(id).unwrap();
+        });
+        let blocked = rx.recv_timeout(std::time::Duration::from_millis(50));
+        assert_eq!(next(&q), 1);
+        let extra = rx.recv_timeout(std::time::Duration::from_secs(1));
+        q.prepared(slow, 0);
+        assert_eq!(blocked, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+        assert_eq!(extra.unwrap(), MAX_PREPARED_REQUESTS);
+    });
+}

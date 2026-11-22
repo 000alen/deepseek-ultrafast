@@ -1,0 +1,53 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: dsuf-gateway
+spec:
+  selector: {app: dsuf-gateway}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dsuf-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: dsuf-gateway}
+  template:
+    metadata:
+      labels: {app: dsuf-gateway}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 65
+      containers:
+        - name: gateway
+          image: deepseek-ultrafast-gateway
+          env:
+            - name: DSUF_CODING_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: dsuf-gateway-auth
+                  key: coding-token
+          ports:
+            - {name: http, containerPort: 8080}
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 2
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities: {drop: [ALL]}
+            seccompProfile: {type: RuntimeDefault}
+          resources:
+            requests: {cpu: "1", memory: 1Gi}
+            limits: {memory: 2Gi}
+          volumeMounts:
+            - {name: config, mountPath: /etc/dsuf, readOnly: true}
+      volumes:
+        - name: config
+          configMap:
+            name: dsuf-gateway-config

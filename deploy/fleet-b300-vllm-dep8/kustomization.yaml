@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../fleet-b300-vllm-dep2
+replicas:
+  - name: dsuf-standard
+    count: 2
+configMapGenerator:
+  - name: dsuf-gateway-config
+    behavior: replace
+    files:
+      - gateway.json
+patches:
+  - path: engine.yaml
+  - target:
+      kind: PodDisruptionBudget
+      name: dsuf-standard
+    patch: |-
+      - op: replace
+        path: /spec/minAvailable
+        value: 1

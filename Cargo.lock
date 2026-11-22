@@ -661,6 +661,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "deepseek-ultrafast-gateway"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "futures",
+ "lru",
+ "rand 0.9.5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "tokio",
+]
+
+[[package]]
 name = "deepseek-ultrafast-kernels"
 version = "0.1.0"
 dependencies = [

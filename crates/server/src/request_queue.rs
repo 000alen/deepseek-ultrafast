@@ -13,7 +13,7 @@ pub trait Request {
 struct State<J, P> {
     pending: VecDeque<J>,
     ready: VecDeque<(J, P)>,
-    preparing: bool,
+    preparing: usize,
     retiring: usize,
     closed: bool,
 }
@@ -52,7 +52,7 @@ impl<J: Request, P> Default for Queue<J, P> {
             state: Mutex::new(State {
                 pending: VecDeque::new(),
                 ready: VecDeque::new(),
-                preparing: false,
+                preparing: 0,
                 retiring: 0,
                 closed: false,
             }),
@@ -86,6 +86,9 @@ impl<J: Request, P> Queue<J, P> {
         }
     }
     pub fn prepare(&self) -> Option<J> {
+        self.prepare_if(|_| true)
+    }
+    pub fn prepare_if(&self, mut eligible: impl FnMut(&J) -> bool) -> Option<J> {
         let mut s = self.state.lock().unwrap();
         loop {
             let (pending, ready) = s.prune();
@@ -96,24 +99,26 @@ impl<J: Request, P> Queue<J, P> {
                 s = self.state.lock().unwrap();
                 continue;
             }
-            if !s.preparing {
-                if s.ready.len() + s.retiring < MAX_PREPARED_REQUESTS
-                    && let Some(job) = s.pending.pop_front()
-                {
-                    s.preparing = true;
-                    return Some(job);
-                }
-                if s.closed && s.pending.is_empty() {
-                    return None;
-                }
+            if s.preparing + s.ready.len() + s.retiring < MAX_PREPARED_REQUESTS
+                && let Some(index) = s.pending.iter().position(&mut eligible)
+            {
+                s.preparing += 1;
+                return s.pending.remove(index);
+            }
+            if s.closed && s.pending.is_empty() {
+                return None;
             }
             s = self.changed.wait(s).unwrap();
         }
     }
+    pub fn wake(&self) {
+        let _state = self.state.lock().unwrap();
+        self.changed.notify_all();
+    }
     pub fn prepared(&self, job: J, prepared: P) {
         let mut s = self.state.lock().unwrap();
-        assert!(s.preparing);
-        s.preparing = false;
+        assert!(s.preparing > 0);
+        s.preparing -= 1;
         if job.cancelled() {
             s.retiring += 1;
             drop(s);
@@ -124,6 +129,12 @@ impl<J: Request, P> Queue<J, P> {
         }
     }
     pub fn pop(&self) -> Option<(J, P)> {
+        self.take(true)
+    }
+    pub fn try_pop(&self) -> Option<(J, P)> {
+        self.take(false)
+    }
+    fn take(&self, wait: bool) -> Option<(J, P)> {
         let mut s = self.state.lock().unwrap();
         loop {
             let (pending, ready) = s.prune();
@@ -138,7 +149,7 @@ impl<J: Request, P> Queue<J, P> {
                 self.changed.notify_all();
                 return Some(item);
             }
-            if s.closed && !s.preparing && s.pending.is_empty() && s.retiring == 0 {
+            if !wait || (s.closed && s.preparing == 0 && s.pending.is_empty() && s.retiring == 0) {
                 return None;
             }
             s = self.changed.wait(s).unwrap();

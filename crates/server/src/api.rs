@@ -1,6 +1,6 @@
 use crate::{chat, responses};
 use crate::request_log::{Output, Trace};
-use crate::generation::{self, Event, Finish, Job};
+use crate::generation::{self, Event, EventSender, Finish, Job, JobIngress, SubmitError};
 use crate::stream::{Detok, StopMatcher};
 use axum::Router;
 use axum::body::Bytes;
@@ -19,21 +19,33 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
 
 pub struct App {
     pub tok: Arc<Tokenizer>,
-    pub jobs: std::sync::mpsc::Sender<Job>,
+    pub jobs: JobIngress,
     pub model: String,
     pub max_seq: usize,
     pub eos: i32,
 }
 
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
+const ADMISSION_HEADER: &str = "x-dsuf-admission";
+const FULL_MESSAGE: &str = "generation capacity exhausted; retry later";
+const CLOSED_MESSAGE: &str = "engine stopped";
+const CONTEXT_MESSAGE: &str = "the request requires a larger context or output pool";
 
 pub fn router_with_readiness(app: Arc<App>, ready: crate::readiness::Readiness) -> Router {
+    let admission_ready = ready.clone();
+    let admission = move |State(app): State<Arc<App>>| {
+        let ready = admission_ready.clone();
+        async move {
+            let status = if ready.is_ready() { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+            (status, [("cache-control", "no-store")], axum::Json(app.jobs.status()))
+        }
+    };
     let health = move || {
         let ready = ready.clone();
         async move {
@@ -44,6 +56,7 @@ pub fn router_with_readiness(app: Arc<App>, ready: crate::readiness::Readiness) 
     Router::new()
         .route("/health", get(health.clone()))
         .route("/readyz", get(health))
+        .route("/internal/admission", get(admission))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(create_response))
@@ -57,11 +70,27 @@ pub fn router_with_readiness(app: Arc<App>, ready: crate::readiness::Readiness) 
 #[derive(Debug)]
 pub struct ApiError(StatusCode, String);
 
+impl ApiError {
+    fn admission(&self) -> Option<&'static str> {
+        match (self.0, self.1.as_str()) {
+            (StatusCode::TOO_MANY_REQUESTS, FULL_MESSAGE) => Some("full"),
+            (StatusCode::SERVICE_UNAVAILABLE, CLOSED_MESSAGE) => Some("closed"),
+            (StatusCode::UNPROCESSABLE_ENTITY, CONTEXT_MESSAGE) => Some("context"),
+            _ => None,
+        }
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let admission = self.admission();
         let kind = if self.0 == StatusCode::TOO_MANY_REQUESTS { "rate_limit_error" }
             else if self.0.is_server_error() { "server_error" } else { "invalid_request_error" };
-        (self.0, axum::Json(json!({ "error": { "message": self.1, "type": kind, "param": null, "code": null } }))).into_response()
+        let mut response = (self.0, axum::Json(json!({ "error": { "message": self.1, "type": kind, "param": null, "code": null } }))).into_response();
+        if let Some(value) = admission {
+            response.headers_mut().insert(ADMISSION_HEADER, axum::http::HeaderValue::from_static(value));
+        }
+        response
     }
 }
 
@@ -77,6 +106,22 @@ fn request_body(body: &[u8]) -> Result<Value, ApiError> {
 fn image_error(error: anyhow::Error) -> ApiError {
     if error.is::<crate::images::Busy>() { ApiError(StatusCode::TOO_MANY_REQUESTS, error.to_string()) }
     else { bad(error) }
+}
+
+async fn prepare_prompt(
+    app: &App,
+    prompt: String,
+    literal_breaks: Vec<usize>,
+    image_offsets: Vec<usize>,
+    image_sources: Vec<deepseek_recipe_core::multimodal::ImageSource>,
+) -> Result<(Vec<i32>, Option<Arc<crate::images::Images>>), ApiError> {
+    crate::images::prepare(app.tok.clone(), prompt, literal_breaks, image_offsets, image_sources, app.max_seq)
+        .await
+        .map_err(|error| {
+            if app.jobs.standard_pool_max_output().is_some() && error.is::<crate::images::ContextCapacity>() {
+                ApiError(StatusCode::UNPROCESSABLE_ENTITY, CONTEXT_MESSAGE.into())
+            } else { image_error(error) }
+        })
 }
 
 #[derive(Clone, Debug, Default)]
@@ -181,9 +226,9 @@ struct Gen {
     output: Output,
     session: String,
     session_source: &'static str,
-    rx: mpsc::UnboundedReceiver<Event>,
+    rx: mpsc::Receiver<Event>,
     cancel: Arc<AtomicBool>,
-    failed: Arc<AtomicBool>,
+    failed: Arc<OnceLock<GenerationFailure>>,
     detok: Detok,
     stop: StopMatcher,
     prompt_tokens: usize,
@@ -193,7 +238,68 @@ struct Gen {
     done: bool,
 }
 
+#[derive(Clone, Copy)]
+enum GenerationFailure {
+    Interrupted,
+    Backpressure,
+    InvalidImage,
+}
+
+impl GenerationFailure {
+    fn from_finish(finish: Finish) -> Option<Self> {
+        match finish {
+            Finish::Stop | Finish::Length => None,
+            Finish::Cancelled => Some(Self::Interrupted),
+            Finish::Backpressure => Some(Self::Backpressure),
+            Finish::InvalidImage => Some(Self::InvalidImage),
+        }
+    }
+
+    fn category(self) -> &'static str {
+        match self {
+            Self::Interrupted => "generation_interrupted",
+            Self::Backpressure => "output_backpressure",
+            Self::InvalidImage => "invalid_image",
+        }
+    }
+
+    fn error(self, subject: &str) -> ApiError {
+        let (status, message) = match self {
+            Self::Interrupted => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("engine stopped before completing the {subject}"),
+            ),
+            Self::Backpressure => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "output buffer filled before the client consumed it".into(),
+            ),
+            Self::InvalidImage => (
+                StatusCode::BAD_REQUEST,
+                "invalid image geometry for the prompt".into(),
+            ),
+        };
+        ApiError(status, message)
+    }
+}
+
+fn generation_error(failed: &OnceLock<GenerationFailure>, subject: &str) -> Option<ApiError> {
+    failed.get().map(|failure| failure.error(subject))
+}
+
+fn response_chunk<T, E: std::fmt::Display>(chunk: Result<T, E>, failed: &OnceLock<GenerationFailure>, subject: &str) -> Result<T, ApiError> {
+    if let Some(error) = generation_error(failed, subject) {
+        return Err(error);
+    }
+    chunk.map_err(|error| ApiError(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+}
+
 impl Gen {
+    fn fail(&mut self, failure: GenerationFailure) {
+        self.trace.error(failure.category());
+        let _ = self.failed.set(failure);
+        self.done = true;
+    }
+
     async fn next(&mut self) -> Option<String> {
         while !self.done {
             let ev = self.rx.recv().await;
@@ -218,6 +324,10 @@ impl Gen {
                     }
                 }
                 Some(Event::Done { finish, completion_tokens }) => {
+                    if let Some(failure) = GenerationFailure::from_finish(finish) {
+                        self.fail(failure);
+                        break;
+                    }
                     self.completion_tokens = completion_tokens;
                     self.done = true;
                     self.finish = Some(if finish == Finish::Length { "length" } else { "stop" });
@@ -231,9 +341,7 @@ impl Gen {
                     }
                 }
                 None => {
-                    self.done = true;
-                    self.trace.reason("error");
-                    self.finish.get_or_insert("stop");
+                    self.fail(GenerationFailure::Interrupted);
                 }
             }
         }
@@ -250,8 +358,7 @@ impl Gen {
                 return None;
             }
             let Some(event) = g.rx.recv().await else {
-                g.failed.store(true, Ordering::Relaxed);
-                g.trace.reason("error");
+                g.fail(GenerationFailure::Interrupted);
                 return None;
             };
             let chunk = match event {
@@ -265,7 +372,10 @@ impl Gen {
                     InferenceChunk::Text { content: g.detok.push(&ids), content_tokens: ids.len() }
                 }
                 Event::Done { finish, completion_tokens } => {
-                    if finish == Finish::Cancelled { g.failed.store(true, Ordering::Relaxed); }
+                    if let Some(failure) = GenerationFailure::from_finish(finish) {
+                        g.fail(failure);
+                        return None;
+                    }
                     let finish_reason = if finish == Finish::Length { InferenceFinishReason::Length } else { InferenceFinishReason::Stop };
                     let chunk = InferenceChunk::Text { content: g.detok.finish(), content_tokens: completion_tokens.saturating_sub(g.completion_tokens) };
                     return Some((chunk, (g, Some(finish_reason))));
@@ -330,10 +440,19 @@ fn submit(app: &Arc<App>, context: RequestContext, tokens: Vec<i32>, s: &Samplin
         return Err(bad("logprobs are not supported"));
     }
     let limit = generation::max_new_limit(tokens.len(), app.max_seq);
+    let requested = s.max_completion_tokens.or(s.max_tokens);
+    if let Some(pool_max) = app.jobs.standard_pool_max_output() {
+        let desired = requested.or(default_max)
+            .unwrap_or(deepseek_ultrafast_model::limits::MAX_OUTPUT_TOKENS)
+            .min(deepseek_ultrafast_model::limits::MAX_OUTPUT_TOKENS);
+        if desired > pool_max || desired > limit {
+            return Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, CONTEXT_MESSAGE.into()));
+        }
+    }
     if limit == 0 {
         return Err(bad(format!("the prompt ({} tokens) does not fit the context ({} tokens)", tokens.len(), app.max_seq)));
     }
-    let max_new = output_budget(s.max_completion_tokens.or(s.max_tokens), default_max, limit)?;
+    let max_new = output_budget(requested, default_max, limit)?;
     let stops = match &s.stop {
         None => vec![],
         Some(Stop::One(x)) => vec![x.clone()],
@@ -345,16 +464,22 @@ fn submit(app: &Arc<App>, context: RequestContext, tokens: Vec<i32>, s: &Samplin
     };
     let (session, session_source) = session_identity(session);
     trace.session(&session, session_source);
-    let (tx, rx) = mpsc::unbounded_channel();
     let cancel = Arc::new(AtomicBool::new(false));
-    let job = Job { trace: trace.clone(), session: session.clone(), images, tokens: Arc::new(tokens), max_new, seed, stop_ids: Arc::new(vec![app.eos]), cancel: cancel.clone(), events: tx };
-    app.jobs.send(job).map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "engine stopped".into()))?;
+    let (events, rx) = EventSender::channel(cancel.clone(), trace.clone());
+    let job = Job {
+        trace: trace.clone(), session: session.clone(), images, tokens: Arc::new(tokens), max_new, seed,
+        stop_ids: Arc::new(vec![app.eos]), cancel: cancel.clone(), events, admission: None,
+    };
+    app.jobs.submit(job).map_err(|error| match error {
+        SubmitError::Full => ApiError(StatusCode::TOO_MANY_REQUESTS, FULL_MESSAGE.into()),
+        SubmitError::Closed => ApiError(StatusCode::SERVICE_UNAVAILABLE, CLOSED_MESSAGE.into()),
+    })?;
     Ok(Gen {
         trace, output: Output::default(),
         session, session_source,
         rx,
         cancel,
-        failed: Arc::new(AtomicBool::new(false)),
+        failed: Arc::new(OnceLock::new()),
         detok: Detok::new(app.tok.clone()),
         stop: StopMatcher::new(stops),
         prompt_tokens: 0,
@@ -390,11 +515,12 @@ async fn chat_completions(State(app): State<Arc<App>>, Extension(trace): Extensi
     let model = app.model.clone();
     let prepared = tokio::task::spawn_blocking(move || chat::prepare(value, &model))
         .await.map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?.map_err(bad)?;
-    let (tokens, images) = crate::images::prepare(app.tok.clone(), prepared.prompt, prepared.literal_breaks, prepared.image_offsets, prepared.image_sources, app.max_seq).await.map_err(image_error)?;
+    let (tokens, images) = prepare_prompt(&app, prepared.prompt, prepared.literal_breaks, prepared.image_offsets, prepared.image_sources).await?;
     let request = prepared.request;
     trace.parsed(tokens.len());
     let g = submit(&app, RequestContext { trace: trace.clone(), ingress }, tokens, &sampling, None, images)?;
     let headers = session_headers(&g);
+    let failed = g.failed.clone();
     let (id, created, model) = (rand_id("chatcmpl-"), now(), app.model.clone());
     let chunks = chat::responses(request, g.into_inference(), id.clone(), model.clone());
 
@@ -409,11 +535,11 @@ async fn chat_completions(State(app): State<Arc<App>>, Extension(trace): Extensi
                     next = chunks.next() => next,
                 };
                 let Some(chunk) = next else { break };
-                let mut chunk = match chunk {
+                let mut chunk = match response_chunk(chunk, &failed, "chat completion") {
                     Ok(chunk) => chunk,
                     Err(error) => {
                         trace.reason("error");
-                        let _ = tx.send(json!({"error": {"message": error.to_string(), "type": "server_error"}})).await;
+                        let _ = tx.send(stream_error(error)).await;
                         return;
                     }
                 };
@@ -432,6 +558,10 @@ async fn chat_completions(State(app): State<Arc<App>>, Extension(trace): Extensi
                     return;
                 }
             }
+            if let Some(error) = generation_error(&failed, "chat completion") {
+                let _ = tx.send(stream_error(error)).await;
+                return;
+            }
             let _ = tx.send(Value::Null).await;
         });
         return Ok((headers, sse_stream(rx)).into_response());
@@ -440,9 +570,12 @@ async fn chat_completions(State(app): State<Arc<App>>, Extension(trace): Extensi
     let mut response = ChatCompletionResponse::new(id, model, created, 0, 0);
     let mut chunks = std::pin::pin!(chunks);
     while let Some(chunk) = chunks.next().await {
-        let chunk = chunk.map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let chunk = response_chunk(chunk, &failed, "chat completion")?;
         log_chat_finish(&trace, chunk.choices.first().and_then(|c| c.finish_reason.as_ref()));
         response.append(chunk);
+    }
+    if let Some(error) = generation_error(&failed, "chat completion") {
+        return Err(error);
     }
     Ok((headers, axum::Json(response)).into_response())
 }
@@ -465,7 +598,7 @@ async fn create_response(State(app): State<Arc<App>>, Extension(trace): Extensio
         seed: prepared.seed,
         ..Default::default()
     };
-    let (tokens, images) = crate::images::prepare(app.tok.clone(), prepared.prompt, prepared.literal_breaks, prepared.image_offsets, prepared.image_sources, app.max_seq).await.map_err(image_error)?;
+    let (tokens, images) = prepare_prompt(&app, prepared.prompt, prepared.literal_breaks, prepared.image_offsets, prepared.image_sources).await?;
     trace.parsed(tokens.len());
     let g = submit(&app, RequestContext { trace: trace.clone(), ingress }, tokens, &sampling, None, images).map_err(|mut e| {
         e.1 = e.1.replace("max_tokens", "max_output_tokens");
@@ -487,23 +620,22 @@ async fn create_response(State(app): State<Arc<App>>, Extension(trace): Extensio
                     next = chunks.next() => next,
                 };
                 let Some(chunk) = next else { break };
-                let chunk = if failed.load(Ordering::Relaxed) {
-                    Err("engine stopped before completing the response".to_string())
-                } else { chunk.map_err(|e| e.to_string()) };
-                match chunk {
+                match response_chunk(chunk, &failed, "response") {
                     Ok(chunk) => {
                         let event = wire.event(chunk);
                         if let Some(response) = event.get("response") { trace.responses_reason(response); }
                         if tx.send(event).await.is_err() { return; }
                         sequence_number += 1;
                     }
-                    Err(message) => {
+                    Err(error) => {
                         trace.reason("error");
-                        let _ = tx.send(json!({"type": "error", "code": "server_error", "message": message,
-                            "param": null, "sequence_number": sequence_number})).await;
+                        let _ = tx.send(responses_stream_error(error, sequence_number)).await;
                         return;
                     }
                 }
+            }
+            if let Some(error) = generation_error(&failed, "response") {
+                let _ = tx.send(responses_stream_error(error, sequence_number)).await;
             }
         });
         let events = tokio_stream::wrappers::ReceiverStream::new(rx).map(|value| {
@@ -514,14 +646,22 @@ async fn create_response(State(app): State<Arc<App>>, Extension(trace): Extensio
     let mut response = ResponsesResponse::new(id, model, now(), 0, 0);
     let mut chunks = std::pin::pin!(chunks);
     while let Some(chunk) = chunks.next().await {
-        if failed.load(Ordering::Relaxed) {
-            return Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, "engine stopped before completing the response".into()));
-        }
-        response.append(chunk.map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?);
+        response.append(response_chunk(chunk, &failed, "response")?);
+    }
+    if let Some(error) = generation_error(&failed, "response") {
+        return Err(error);
     }
     let response = responses::wire_response(response, &response_options);
     trace.responses_reason(&response);
     Ok((headers, axum::Json(response)).into_response())
+}
+
+fn stream_error(error: ApiError) -> Value {
+    json!({"error": {"message": error.1, "type": "server_error"}})
+}
+
+fn responses_stream_error(error: ApiError, sequence_number: usize) -> Value {
+    json!({"type": "error", "code": "server_error", "message": error.1, "param": null, "sequence_number": sequence_number})
 }
 
 #[derive(Deserialize)]
@@ -561,6 +701,10 @@ async fn completions(State(app): State<Arc<App>>, Extension(trace): Extension<Tr
                 let Some(text) = text else { break };
                 if tx.send(chunk(&text, None)).await.is_err() { return; }
             }
+            if let Some(error) = generation_error(&g.failed, "completion") {
+                let _ = tx.send(stream_error(error)).await;
+                return;
+            }
             if let Some(reason) = g.finish { trace.reason(reason); }
             let _ = tx.send(chunk("", Some(g.finish.unwrap_or("stop")))).await;
             if include_usage {
@@ -574,6 +718,9 @@ async fn completions(State(app): State<Arc<App>>, Extension(trace): Extension<Tr
     while let Some(t) = g.next().await {
         text += &t;
     }
+    if let Some(error) = generation_error(&g.failed, "completion") {
+        return Err(error);
+    }
     if let Some(reason) = g.finish { trace.reason(reason); }
     Ok((headers, axum::Json(json!({
         "id": id, "object": "text_completion", "created": created, "model": model,
@@ -581,6 +728,107 @@ async fn completions(State(app): State<Arc<App>>, Extension(trace): Extension<Tr
         "usage": g.usage(),
     })))
     .into_response())
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+    use axum::{body::{Body, to_bytes}, http::Request};
+    use tower::ServiceExt;
+
+    fn fixture() -> (Router, JobIngress, mpsc::Receiver<Job>) {
+        let (jobs, requests) = JobIngress::channel(1, 1 << 20);
+        let tok = Arc::new(crate::test_support::tokenizer());
+        let eos = tok.token_to_id(chat::EOS).unwrap() as i32;
+        let app = Arc::new(App { tok, jobs: jobs.clone(), model: "deepseek-v4.1-flash".to_string(), max_seq: 4096, eos });
+        (router_with_readiness(app, crate::readiness::Readiness::ready()), jobs, requests)
+    }
+
+    fn post(path: &str, body: Value) -> Request<Body> {
+        Request::post(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn overload_and_shutdown_are_json_errors_before_streaming() {
+        let (router, jobs, mut requests) = fixture();
+        let request = || post("/v1/completions", json!({"prompt":"hi", "stream":true}));
+        let first = router.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let active = requests.try_recv().unwrap();
+        let full = router.clone().oneshot(request()).await.unwrap();
+        assert_eq!(full.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(full.headers()["content-type"], "application/json");
+        assert_eq!(full.headers()[ADMISSION_HEADER], "full");
+        jobs.close();
+        let stopped = router.oneshot(request()).await.unwrap();
+        assert_eq!(stopped.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(stopped.headers()["content-type"], "application/json");
+        assert_eq!(stopped.headers()[ADMISSION_HEADER], "closed");
+        drop(active);
+        drop(first);
+    }
+
+    #[tokio::test]
+    async fn fleet_pool_rejects_unfit_turns_and_reports_admission() {
+        let (router, jobs, mut requests) = fixture();
+        let jobs = jobs.with_standard_pool(32);
+        let bigger = post("/v1/messages", json!({"messages":[{"role":"user","content":"hi"}], "max_tokens":33, "stream":true}));
+        let bigger = router.clone().oneshot(bigger).await.unwrap();
+        assert_eq!(bigger.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(bigger.headers()[ADMISSION_HEADER], "context");
+        assert!(requests.try_recv().is_err());
+
+        let response = router.clone().oneshot(post("/v1/completions", json!({"prompt":"hi","stream":true}))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let job = requests.try_recv().unwrap();
+        job.mark_active();
+        job.mark_active();
+        jobs.load_reporter().set_kv_usage(12, 16, 4);
+        let probe = router.oneshot(Request::get("/internal/admission").body(Body::empty()).unwrap()).await.unwrap();
+        let status: Value = serde_json::from_slice(&to_bytes(probe.into_body(), 1024).await.unwrap()).unwrap();
+        assert_eq!(status["active"], 1);
+        assert_eq!(status["queued"], 0);
+        assert_eq!(status["available"], 0);
+        assert_eq!(status["kv_free_bytes"], 12);
+        assert_eq!(status["kv_reserved_bytes"], 16);
+        assert_eq!(status["kv_mapped_bytes"], 4);
+        jobs.cancel_outstanding();
+        assert!(job.cancel.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn streaming_adapters_report_request_failures_as_terminal_errors() {
+        let (router, _, mut requests) = fixture();
+        let cases = [
+            ("/v1/chat/completions", json!({"messages":[{"role":"user","content":"hi"}], "stream":true})),
+            ("/v1/completions", json!({"prompt":"hi", "stream":true})),
+            ("/v1/responses", json!({"input":"hi", "stream":true})),
+            ("/v1/messages", json!({"messages":[{"role":"user","content":"hi"}], "max_tokens":16, "stream":true})),
+        ];
+        for (path, body) in cases {
+            for (finish, message) in [
+                (Finish::Backpressure, "output buffer filled before the client consumed it"),
+                (Finish::InvalidImage, "invalid image geometry for the prompt"),
+            ] {
+                let response = router.clone().oneshot(post(path, body.clone())).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+                let job = requests.try_recv().unwrap();
+                if finish == Finish::Backpressure {
+                    job.events.send(Event::Started { prompt_tokens: job.tokens.len(), cached_tokens: 0 }).unwrap();
+                }
+                job.done(finish, 0);
+                drop(job);
+                let wire = tokio::time::timeout(std::time::Duration::from_secs(2), to_bytes(response.into_body(), 1 << 20)).await.unwrap().unwrap();
+                let wire = std::str::from_utf8(&wire).unwrap();
+                assert!(wire.contains(message), "{path}: {wire}");
+                assert!(!wire.contains("[DONE]"), "{path}: {wire}");
+            }
+        }
+    }
+
 }
 
 #[cfg(test)]

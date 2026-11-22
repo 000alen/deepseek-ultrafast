@@ -1,27 +1,9 @@
-#include "common.cuh"
+#include "attn_params.cuh"
 
 struct Meta {
     int pos;
     int m;
     int tokens[16];
-};
-
-struct AttnFParams {
-    const bf16* q;
-    const bf16* win;
-    const bf16* comp;
-    const int* topk;
-    int ktop;
-    float scale;
-    const float* sink;
-    bf16* out;
-    const float* cos;
-    const float* sin;
-    int R;
-    int fixed_window;
-    int nh;
-    int pre;
-    int win_floor;
 };
 
 namespace sds {
@@ -116,7 +98,7 @@ DEV const bf16* col_row(const AttnFParams& p, int m, int pos0, int c, bool befor
         const int ps = wend - (kSwa - 1) + c;
         if (ps < p.win_floor) return nullptr;
         if (before_wait && !((p.pre & 1) && ps < pos0)) return (const bf16*)1;
-        return p.win + (size_t)ps * kDim;
+        return p.win + (size_t)cache_row(ps, p.ring_rows) * kDim;
     }
     if (c >= kSwa + p.ktop) return nullptr;
     if (before_wait && !(p.pre & 2)) return (const bf16*)1;

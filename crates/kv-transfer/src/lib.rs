@@ -21,16 +21,17 @@ use rdma::{DataPlane, Staged};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, Weak, atomic::{AtomicBool, AtomicU64, Ordering}};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
-use velo::{DataHandle, Handler, PeerInfo, TypedContext};
+use velo::{DataHandle, Handler, InstanceId, PeerInfo, TypedContext, Velo};
 
 const HANDLER: &str = "deepseek-ultrafast.kv.rdma.v2";
 pub const MAX_LEASES: usize = 8;
 const MAX_ENTRIES: usize = 1024;
+const LEASE_CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 pub struct Config {
@@ -68,13 +69,49 @@ enum Reply {
     Closed,
 }
 struct Offer {
-    lease: Uuid,
+    lease: DonorLease,
     revision: Revision,
     manifest: Box<Manifest>,
     handle: DataHandle,
     common: usize,
     aligned: Option<Aligned>,
 }
+
+/// An application-level offer lease. Velo's separate read lease protects the
+/// staged region if a cancelled GET is still in flight.
+struct DonorLease {
+    id: Uuid,
+    peer: InstanceId,
+    velo: Arc<Velo>,
+    runtime: tokio::runtime::Handle,
+    cleanup_slot: Option<OwnedSemaphorePermit>,
+}
+
+impl Drop for DonorLease {
+    fn drop(&mut self) {
+        let Some(cleanup_slot) = self.cleanup_slot.take() else {
+            return;
+        };
+        let (lease, peer, velo) = (self.id, self.peer, self.velo.clone());
+        self.runtime.spawn(async move {
+            let deadline = Instant::now() + LEASE_CLOSE_TIMEOUT;
+            let _ = peer_rpc(&velo, peer, Fetch::Close { lease }, deadline).await;
+            drop(cleanup_slot);
+        });
+    }
+}
+
+async fn peer_rpc(velo: &Velo, peer: InstanceId, request: Fetch, deadline: Instant) -> Result<Reply> {
+    ensure!(Instant::now() < deadline, "KV peer deadline elapsed");
+    tokio::time::timeout_at(
+        deadline.into(),
+        velo.typed_unary::<Reply>(HANDLER)?.payload(request)?.instance(peer).send(),
+    )
+    .await
+    .inspect_err(|_| deepseek_ultrafast_logging::kv_failure("control_timeout"))?
+    .inspect_err(|_| deepseek_ultrafast_logging::kv_failure("control_request"))
+}
+
 struct Stored {
     snapshot: Arc<Snapshot>,
     staged: Arc<Staged>,
@@ -131,6 +168,7 @@ struct State {
     watching: bool,
     epoch: Option<Uuid>,
     entries: HashMap<String, Entry>,
+    pending_claims: HashMap<String, Vec<Weak<AtomicU64>>>,
     leases: HashMap<Uuid, Lease>,
     clock: u64,
     evictions: Vec<LogEvent>,
@@ -146,18 +184,54 @@ impl State {
     fn expire(&mut self) {
         self.leases.retain(|_, l| l.expires > Instant::now());
     }
+    fn clear_local(&mut self) {
+        self.entries.clear();
+        self.pending_claims.clear();
+    }
     fn epoch(&mut self, epoch: Uuid) {
         if self.epoch != Some(epoch) {
-            self.entries.clear();
+            self.clear_local();
             self.epoch = Some(epoch);
         }
     }
     fn invalidate(&mut self, key: &str, revision: Revision) {
+        if self.epoch == Some(revision.epoch)
+            && let Some(claims) = self.pending_claims.get(key)
+        {
+            for claim in claims.iter().filter_map(Weak::upgrade) {
+                claim.fetch_max(revision.sequence, Ordering::Relaxed);
+            }
+        }
         if self.entries.get(key).is_some_and(|e| {
             e.revision.epoch == revision.epoch && e.revision.sequence < revision.sequence
         }) {
             self.remove(key, EvictionReason::OtherReplica);
         }
+    }
+    fn start_claim(&mut self, key: &str) -> Arc<AtomicU64> {
+        // A cancelled claimant drops its ticket without needing to take this
+        // lock from a destructor.
+        self.pending_claims.retain(|_, claims| {
+            claims.retain(|claim| claim.strong_count() > 0);
+            !claims.is_empty()
+        });
+        let ticket = Arc::new(AtomicU64::new(0));
+        self.pending_claims
+            .entry(key.to_owned())
+            .or_default()
+            .push(Arc::downgrade(&ticket));
+        ticket
+    }
+    fn finish_claim(&mut self, key: &str, ticket: &Arc<AtomicU64>) -> Option<u64> {
+        let claims = self.pending_claims.get_mut(key)?;
+        let index = claims
+            .iter()
+            .position(|claim| claim.as_ptr() == Arc::as_ptr(ticket))?;
+        claims.swap_remove(index);
+        if claims.is_empty() {
+            self.pending_claims.remove(key);
+        }
+        Some(ticket.load(Ordering::Relaxed))
     }
     #[cfg(test)]
     fn insert(&mut self, key: String, revision: Revision, stored: Arc<Stored>, budget: usize) {
@@ -293,6 +367,8 @@ pub struct PeerCache {
     scope: String,
     state: Arc<Mutex<State>>,
     fetch_slot: Semaphore,
+    lease_cleanup_slots: Arc<Semaphore>,
+    data_plane_failures: AtomicU64,
     closing: Arc<AtomicBool>,
     tasks: Vec<JoinHandle<()>>,
 }
@@ -395,7 +471,7 @@ impl PeerCache {
                     if stop.load(Ordering::Acquire) { return; }
                     let mut state = watched.lock().await;
                     state.watching = false;
-                    state.entries.clear();
+                    state.clear_local();
                     drop(state);
                     deepseek_ultrafast_logging::redis_failure("kv", "ownership_subscription_closed");
                 }
@@ -444,7 +520,7 @@ impl PeerCache {
                                 "KV directory reconciliation failed; discarding local cache: {error:#}"
                             );
                         }
-                        state.entries.clear();
+                        state.clear_local();
                         state.watching = false;
                     }
                 }
@@ -460,12 +536,25 @@ impl PeerCache {
             scope,
             state,
             fetch_slot: Semaphore::new(1),
+            lease_cleanup_slots: Arc::new(Semaphore::new(MAX_LEASES)),
+            data_plane_failures: AtomicU64::new(0),
             closing,
             tasks: vec![watch, reconcile],
         })
     }
     pub fn fingerprint(&self) -> &str {
         &self.config.fingerprint
+    }
+
+    /// Cumulative count of failed data-plane registrations, GETs, and staging
+    /// operations since this replica started its peer cache.
+    pub fn data_plane_failures(&self) -> u64 {
+        self.data_plane_failures.load(Ordering::Relaxed)
+    }
+
+    fn record_data_plane_failure(&self, operation: &'static str) {
+        self.data_plane_failures.fetch_add(1, Ordering::Relaxed);
+        deepseek_ultrafast_logging::kv_failure(operation);
     }
     #[allow(
         clippy::misnamed_getters,
@@ -528,9 +617,20 @@ impl PeerCache {
     }
 
     pub async fn lookup(&self, session: &str, prompt: Prompt<'_>) -> Result<Candidate> {
-        let _slot = self.fetch_slot.acquire().await?;
+        self.lookup_before(session, prompt, Instant::now() + self.config.timeout).await
+    }
+
+    /// Resolve and, when possible, retrieve the cached prefix by the caller's
+    /// preparation deadline. Donor failures leave the observed ownership fence
+    /// available for publication after recomputing the prefix.
+    pub async fn lookup_before(
+        &self,
+        session: &str,
+        prompt: Prompt<'_>,
+        deadline: Instant,
+    ) -> Result<Candidate> {
         let key = digest(session.as_bytes());
-        let owner = self.owner(&key).await?;
+        let owner = tokio::time::timeout_at(deadline.into(), self.owner(&key)).await??;
         let tokens = prompt.tokens;
         let mut candidate = Candidate {
             revision: owner.revision,
@@ -546,24 +646,62 @@ impl PeerCache {
             return Ok(candidate);
         };
         if peer.instance_id() == self.plane.velo.instance_id() {
-            return Ok(self.local_candidate(key, owner.revision, prompt).await);
+            return Ok(tokio::time::timeout_at(deadline.into(), self.local_candidate(key, owner.revision, prompt))
+                .await.unwrap_or(candidate));
         }
-        {
+        let invalidate = async {
             let mut state = self.state.lock().await;
             state.invalidate(&key, owner.revision);
             let evictions = state.take_evictions();
             drop(state);
             evictions.into_iter().for_each(deepseek_ultrafast_logging::emit);
+        };
+        if tokio::time::timeout_at(deadline.into(), invalidate).await.is_err() {
+            return Ok(candidate);
         }
-        self.plane.register_peer(peer.clone()).inspect_err(|_| deepseek_ultrafast_logging::kv_failure("register_peer"))?;
+
+        // Ownerless requests and local hits never wait behind a donor. The remote
+        // transfer still has one slot so concurrent preparations fit the same
+        // registered-memory and retained-snapshot budget.
+        let Ok(Ok(_slot)) = tokio::time::timeout_at(deadline.into(), self.fetch_slot.acquire())
+            .await
+            .inspect_err(|_| deepseek_ultrafast_logging::kv_failure("fetch_slot_timeout"))
+        else {
+            return Ok(candidate);
+        };
+        if let Err(error) = self.fetch_remote(&peer, prompt, &mut candidate, deadline).await {
+            deepseek_ultrafast_logging::diagnostic!("KV donor cache miss: key={key} {error:#}");
+        }
+        Ok(candidate)
+    }
+
+    async fn fetch_remote(
+        &self,
+        peer: &PeerInfo,
+        prompt: Prompt<'_>,
+        candidate: &mut Candidate,
+        deadline: Instant,
+    ) -> Result<()> {
+        let key = &candidate.key;
+        let tokens = prompt.tokens;
+        self.plane
+            .register_peer(peer.clone())
+            .inspect_err(|_| self.record_data_plane_failure("register_peer"))?;
+        let mut expected = candidate.revision;
         let mut best: Option<Offer> = None;
         for checkpoint_request in [false, true] {
-            let request = if checkpoint_request {
-                Fetch::Checkpoint { key: key.clone(), revision: candidate.revision }
-            } else {
-                Fetch::Open { key: key.clone(), revision: candidate.revision }
+            // Reserve bounded background cleanup before asking a donor to
+            // allocate a lease. If the reply is lost, only its TTL can reap it.
+            let Ok(cleanup_slot) = self.lease_cleanup_slots.clone().try_acquire_owned() else {
+                deepseek_ultrafast_logging::kv_failure("lease_cleanup_busy");
+                break;
             };
-            let reply = match self.rpc(&peer, request).await {
+            let request = if checkpoint_request {
+                Fetch::Checkpoint { key: key.clone(), revision: expected }
+            } else {
+                Fetch::Open { key: key.clone(), revision: expected }
+            };
+            let reply = match peer_rpc(&self.plane.velo, peer.instance_id(), request, deadline).await {
                 Ok(reply) => reply,
                 Err(e) => {
                     deepseek_ultrafast_logging::diagnostic!("KV donor unavailable before transfer: key={key} {e:#}");
@@ -574,40 +712,50 @@ impl PeerCache {
                 deepseek_ultrafast_logging::diagnostic!("KV cache miss: key={key} reason=donor_entry_unavailable prompt={}", tokens.len());
                 break;
             };
-            if revision.epoch != candidate.revision.epoch || revision.sequence < candidate.revision.sequence {
-                let _ = self.rpc(&peer, Fetch::Close { lease }).await;
-                if let Some(offer) = best { let _ = self.rpc(&peer, Fetch::Close { lease: offer.lease }).await; }
-                return Err(RdmaRequired("donor returned a stale/different-epoch revision".into()).into());
+            let lease = DonorLease {
+                id: lease,
+                peer: peer.instance_id(),
+                velo: self.plane.velo.clone(),
+                runtime: tokio::runtime::Handle::current(),
+                cleanup_slot: Some(cleanup_slot),
+            };
+            if revision.epoch != expected.epoch || revision.sequence < expected.sequence {
+                anyhow::bail!("donor returned a stale/different-epoch revision");
             }
-            candidate.revision = revision;
+            expected = revision;
             let (common, aligned) = match manifest.validate(&self.config.fingerprint, self.config.max_seq, self.config.max_snapshot_bytes) {
                 Ok(()) => self.reuse(&manifest, prompt),
                 Err(e) => { deepseek_ultrafast_logging::diagnostic!("KV incompatible candidate: key={key} {e:#}"); (0, None) }
             };
             if common > 0 && best.as_ref().is_none_or(|offer| common > offer.common) {
-                if let Some(offer) = best.take() { let _ = self.rpc(&peer, Fetch::Close { lease: offer.lease }).await; }
                 if checkpoint_request {
                     deepseek_ultrafast_logging::diagnostic!("KV input checkpoint reused: key={key} prefix={common} prompt={}", tokens.len());
                 }
                 best = Some(Offer { lease, revision, manifest, handle, common, aligned });
             } else {
-                if common == 0 && best.is_none() && !checkpoint { report_prefix_miss(&key, &manifest, prompt); }
-                let _ = self.rpc(&peer, Fetch::Close { lease }).await;
+                if common == 0 && best.is_none() && !checkpoint { report_prefix_miss(key, &manifest, prompt); }
             }
             let limit = checkpoint_tokens.unwrap_or(usize::MAX).min(tokens.len() - 1);
             if !checkpoint || best.as_ref().is_some_and(|offer| offer.common >= limit) { break; }
         }
         if let Some(Offer { lease, revision, manifest, handle, aligned, .. }) = best {
-            let result = self.receive(&key, &peer, *manifest, handle, aligned.as_ref().map_or(prompt, Aligned::prompt)).await;
-            let _ = self.rpc(&peer, Fetch::Close { lease }).await;
-            candidate.revision = revision;
+            let result = self.receive(
+                key,
+                peer,
+                *manifest,
+                handle,
+                aligned.as_ref().map_or(prompt, Aligned::prompt),
+                deadline,
+            ).await;
+            drop(lease);
             if let Some((snapshot, staged)) = result? {
+                candidate.revision = revision;
                 candidate.snapshot = Some(snapshot);
                 candidate.aligned = aligned;
-                candidate.staged = staged;
+                candidate.staged = Some(staged);
             }
         }
-        Ok(candidate)
+        Ok(())
     }
     fn reuse(&self, manifest: &Manifest, prompt: Prompt) -> (usize, Option<Aligned>) {
         let exact = manifest.reusable_prefix(prompt);
@@ -620,20 +768,6 @@ impl PeerCache {
         }
         (exact, None)
     }
-    async fn rpc(&self, peer: &PeerInfo, request: Fetch) -> Result<Reply> {
-        tokio::time::timeout(
-            self.config.timeout,
-            self.plane
-                .velo
-                .typed_unary::<Reply>(HANDLER)?
-                .payload(request)?
-                .instance(peer.instance_id())
-                .send(),
-        )
-        .await
-        .inspect_err(|_| deepseek_ultrafast_logging::kv_failure("control_timeout"))?
-        .inspect_err(|_| deepseek_ultrafast_logging::kv_failure("control_request"))
-    }
     async fn receive(
         &self,
         key: &str,
@@ -641,7 +775,8 @@ impl PeerCache {
         manifest: Manifest,
         handle: DataHandle,
         prompt: Prompt<'_>,
-    ) -> Result<Option<(Arc<Snapshot>, Option<Arc<Staged>>)>> {
+        deadline: Instant,
+    ) -> Result<Option<(Arc<Snapshot>, Arc<Staged>)>> {
         if let Err(e) = manifest.validate(
             &self.config.fingerprint,
             self.config.max_seq,
@@ -654,17 +789,18 @@ impl PeerCache {
             report_prefix_miss(key, &manifest, prompt);
             return Ok(None);
         }
-        ensure!(
-            handle.unpack().0 == peer.worker_id(),
-            RdmaRequired("donor handle names another worker".into())
-        );
-        let data = tokio::time::timeout(
-            self.config.timeout,
+        if handle.unpack().0 != peer.worker_id() {
+            self.record_data_plane_failure("donor_handle");
+            return Err(RdmaRequired("donor handle names another worker".into()).into());
+        }
+        ensure!(Instant::now() < deadline, "KV peer deadline elapsed");
+        let data = tokio::time::timeout_at(
+            deadline.into(),
             self.plane.receive(handle, manifest.bytes),
         )
         .await
-        .map_err(|error| { deepseek_ultrafast_logging::kv_failure("get_timeout"); rdma::required(error) })?
-        .inspect_err(|_| deepseek_ultrafast_logging::kv_failure("get"))?;
+        .inspect_err(|_| self.record_data_plane_failure("get_timeout"))?
+        .inspect_err(|_| self.record_data_plane_failure("get"))?;
         let snapshot = Arc::new(Snapshot { manifest, data });
         snapshot
             .validate(
@@ -672,9 +808,12 @@ impl PeerCache {
                 self.config.max_seq,
                 self.config.max_snapshot_bytes,
             )
-            .map_err(rdma::required)?;
-        let staged = Some(self.plane.stage(&snapshot.data).await
-            .inspect_err(|_| deepseek_ultrafast_logging::kv_failure("registration"))?);
+            .inspect_err(|_| deepseek_ultrafast_logging::kv_failure("snapshot_invalid"))?;
+        ensure!(Instant::now() < deadline, "KV peer deadline elapsed");
+        let staged = tokio::time::timeout_at(deadline.into(), self.plane.stage(&snapshot.data))
+            .await
+            .inspect_err(|_| self.record_data_plane_failure("registration_timeout"))?
+            .inspect_err(|_| self.record_data_plane_failure("registration"))?;
         Ok(Some((snapshot, staged)))
     }
     pub async fn onboard_named(&self, session: &str, candidate: &Candidate, session_id: Option<Arc<str>>) -> Result<Revision> {
@@ -720,7 +859,7 @@ impl PeerCache {
             self.config.max_snapshot_bytes,
         )?;
         let staged = self.plane.stage(&snapshot.data).await
-            .inspect_err(|_| deepseek_ultrafast_logging::kv_failure("registration"))?;
+            .inspect_err(|_| self.record_data_plane_failure("registration"))?;
         self.announce(session, revision, Arc::new(Stored { snapshot, staged }), Some(input_tokens), session_id)
             .await
     }
@@ -733,26 +872,30 @@ impl PeerCache {
         session_id: Option<Arc<str>>,
     ) -> Result<Revision> {
         let key = digest(session.as_bytes());
-        let mut state = self.state.lock().await;
-        ensure!(
-            state.watching,
-            "KV ownership subscriber/directory unavailable"
-        );
-        ensure!(
-            state.epoch == Some(revision.epoch),
-            "local directory epoch advanced"
-        );
-        ensure!(
-            state
-                .entries
-                .get(&key)
-                .is_none_or(|e| e.revision.epoch == revision.epoch
+        let ticket = {
+            let mut state = self.state.lock().await;
+            ensure!(state.watching, "KV ownership subscriber/directory unavailable");
+            ensure!(state.epoch == Some(revision.epoch), "local directory epoch advanced");
+            ensure!(
+                state.entries.get(&key).is_none_or(|e| e.revision.epoch == revision.epoch
                     && e.revision.sequence <= revision.sequence),
-            "local ownership generation advanced"
-        );
+                "local ownership generation advanced"
+            );
+            state.start_claim(&key)
+        };
         let result = self.dir.claim(&self.scope, &key, revision, &self.plane.velo.peer_info()).await;
+        // Observe invalidations that landed during the CAS. Do not hold the
+        // cache state lock across Redis I/O, including reconnects and timeouts.
+        let mut state = self.state.lock().await;
+        let invalidated_through = state.finish_claim(&key, &ticket);
         let outcome = match result {
             Ok(owner) => {
+                ensure!(
+                    state.watching && state.epoch == Some(owner.revision.epoch)
+                        && invalidated_through.is_some_and(|seq| seq <= owner.revision.sequence)
+                        && state.entries.get(&key).is_none_or(|e| e.revision.sequence <= owner.revision.sequence),
+                    "ownership advanced during KV publication"
+                );
                 state.install_named(key, owner.revision, stored, self.config.max_bytes,
                     input_tokens.map(|input| (revision, input)), session_id);
                 Ok(owner.revision)
@@ -782,7 +925,7 @@ impl PeerCache {
         {
             let mut state = self.state.lock().await;
             state.watching = false;
-            state.entries.clear();
+            state.clear_local();
             state.leases.clear();
         }
         self.plane.shutdown().await;

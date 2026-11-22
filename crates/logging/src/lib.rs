@@ -45,6 +45,43 @@ pub struct TerminalError {
     pub column: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct PackedPlanBudget {
+    pub busy_prefill_budget_ms: f64,
+    pub busy_prefill_rows: usize,
+    pub active_decoders: usize,
+    pub active_decoder_limit: usize,
+    pub prefill_backlog_requests: usize,
+    pub decode_samples: usize,
+    pub decode_window_ms: Option<f64>,
+    pub peak_plan_id: Option<u64>,
+    pub peak_wall_ms: Option<f64>,
+    pub peak_decode_lanes: Option<usize>,
+    pub non_prefill_peak_plan_id: Option<u64>,
+    pub non_prefill_peak_ms: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PackedPlanStep {
+    pub plan_id: u64,
+    pub wall_ms: f64,
+    pub decode_ms: Option<f64>,
+    pub decode_forward_ms: Option<f64>,
+    pub decode_lanes: usize,
+    pub decode_tokens: usize,
+    pub prefill_encode_rows: usize,
+    pub prefill_replay_rows: usize,
+    pub prefill_ms: Option<f64>,
+    pub restore_ms: Option<f64>,
+    pub restore_bytes: Option<usize>,
+    pub retirement_ms: Option<f64>,
+    pub retirement_anchor_ms: Option<f64>,
+    pub retirement_export_ms: Option<f64>,
+    pub export_bytes: Option<usize>,
+    #[serde(flatten)]
+    pub budget: PackedPlanBudget,
+}
+
 #[derive(Debug, Serialize)]
 #[expect(
     clippy::large_enum_variant,
@@ -63,6 +100,19 @@ pub enum Event {
         elapsed_ms: f64,
     },
     HealthReady,
+    PackedDecodeReady {
+        max_residents: usize,
+        max_decode_width: usize,
+        slot_bytes_per_rank: usize,
+        kv_bytes_per_rank: usize,
+    },
+    PackedDecodeStep {
+        plan_id: u64,
+        lanes: Vec<[u64; 2]>,
+        scheduled_target_rows: usize,
+        elapsed_ms: f64,
+    },
+    PackedPlanStep(PackedPlanStep),
     RedisConnectionFailure {
         component: &'static str,
         operation: &'static str,

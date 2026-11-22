@@ -16,7 +16,17 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,targe
     cargo build --locked --release -p deepseek-ultrafast-server -p deepseek-ultrafast-kv-transfer --bins && \
     cp target/release/serve target/release/kv-rdma-check /usr/local/bin/
 
-FROM nvidia/cuda:13.0.1-runtime-ubuntu24.04
+FROM build AS probe-build
+RUN apt-get update && apt-get install -y --no-install-recommends jq && rm -rf /var/lib/apt/lists/*
+RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git --mount=type=cache,id=deepseek-ultrafast-image-target-${DSUF_SM},target=/src/target \
+    cargo build --locked --release -p deepseek-ultrafast-engine --bin run && \
+    cp target/release/run /usr/local/bin/dsuf-batch-probe && \
+    cargo test --locked --release -p deepseek-ultrafast-cuda --lib --no-run --message-format=json > /tmp/cuda-test.json && \
+    jq -er 'select(.reason == "compiler-artifact" and .target.name == "deepseek_ultrafast_cuda" and .profile.test and .executable != null) | .executable' /tmp/cuda-test.json > /tmp/cuda-test.path && \
+    cp "$(cat /tmp/cuda-test.path)" /usr/local/bin/dsuf-cuda-test && \
+    rm /tmp/cuda-test.json /tmp/cuda-test.path
+
+FROM nvidia/cuda:13.0.1-runtime-ubuntu24.04 AS runtime
 ARG CUDNN_VERSION=9.14.0.64-1
 RUN apt-get update && apt-get install -y --no-install-recommends tini ca-certificates libibverbs1 ibverbs-providers librdmacm1 \
     libcudnn9-cuda-13=${CUDNN_VERSION} libopencv-imgcodecs406 libopencv-imgproc406 \
@@ -26,3 +36,8 @@ ENV NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=compute,utility
 EXPOSE 8000 19500
 ENTRYPOINT ["/usr/bin/tini", "--", "serve", "--host", "0.0.0.0", "--ckpt", "/models"]
 CMD ["--gpus", "0,1,2,3", "--port", "8000"]
+
+FROM runtime AS b200-parity
+COPY --from=probe-build /usr/local/bin/dsuf-batch-probe /usr/local/bin/dsuf-cuda-test /usr/local/bin/
+
+FROM runtime

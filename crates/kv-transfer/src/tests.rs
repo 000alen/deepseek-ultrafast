@@ -68,6 +68,23 @@ fn lease_pins_registered_generation_across_invalidation_replacement_and_lru() {
 }
 
 #[test]
+fn publication_observes_invalidation_while_the_directory_claim_is_in_flight() {
+    let mut state = State::default();
+    state.epoch(Uuid::nil());
+    let claim = state.start_claim("branch");
+    let unrelated = state.start_claim("other");
+    // No local cache entry exists yet when the newer publication arrives.
+    state.invalidate("branch", revision(11));
+    state.invalidate("branch", revision(10));
+    assert_eq!(state.finish_claim("branch", &claim), Some(11));
+    assert_eq!(state.finish_claim("other", &unrelated), Some(0));
+
+    let claim = state.start_claim("branch");
+    state.epoch(Uuid::new_v4());
+    assert_eq!(state.finish_claim("branch", &claim), None);
+}
+
+#[test]
 fn entries_serve_identical_images_and_stop_at_a_changed_one() {
     const IM: i32 = 129264;
     let span = |start: usize, len: usize, pixels: u8| snapshot::ImageSpan {

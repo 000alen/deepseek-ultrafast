@@ -1,9 +1,19 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use deepseek_ultrafast_cuda::{self as cu, Args, Buffer, DevPtr, Launch, Stream};
 use deepseek_ultrafast_kernels::Kernels;
 use deepseek_ultrafast_model::{st::Checkpoint, vision::{Image, VisionConfig, MAX_PATCHES}};
 use cudarc::cublas::sys as blas;
 use std::{collections::VecDeque, sync::Arc};
+
+/// Request image metadata is invalid before staging allocates device state.
+#[derive(Debug)]
+pub struct InvalidImageStaging;
+
+impl std::fmt::Display for InvalidImageStaging {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid image geometry for the prompt")
+    }
+}
 
 fn finish_uploads() -> Result<()> {
     cu::check(unsafe { cu::sys::cuStreamSynchronize(std::ptr::null_mut()) }, "finish vision uploads")
@@ -63,12 +73,25 @@ pub struct Vision {
     pub biases: Vec<Buffer>,
     scratch: Option<Scratch>,
     cache: VecDeque<([u8;32], Arc<Buffer>)>, cache_bytes: usize,
-    active: Vec<(usize, usize, Arc<Buffer>)>,
-    spans: Option<Buffer>,
-    pub span_count: usize,
+    staged: StagedImages,
     pub encodes: usize,
     pub hits: usize,
 }
+
+/// Encoded image rows and routing spans for one prompt on one GPU rank.
+/// Keep the stage alive until all CUDA work using it has completed.
+#[derive(Default)]
+pub struct StagedImages {
+    active: Vec<(usize, usize, Arc<Buffer>)>,
+    spans: Option<Buffer>,
+    span_count: usize,
+    pending: VecDeque<Image>,
+}
+
+impl StagedImages {
+    pub(crate) fn is_complete(&self) -> bool { self.pending.is_empty() }
+}
+
 impl Vision {
     pub fn load(ck: &Checkpoint, dim: usize, layers: usize, stream: &Stream) -> Result<Self> {
         let c = VisionConfig::load(&ck.dir.join("inference/config.json"))?;
@@ -92,7 +115,7 @@ impl Vision {
             start:Buffer::from_host(ck.get("image_start", "BF16", &[dim])?)?,
             newline:Buffer::from_host(ck.get("image_newline", "BF16", &[dim])?)?,
             end:Buffer::from_host(ck.get("image_end", "BF16", &[dim])?)?,
-            biases, scratch:None, cache:VecDeque::new(), cache_bytes:0, active:Vec::new(), spans:None, span_count:0, encodes:0, hits:0 };
+            biases, scratch:None, cache:VecDeque::new(), cache_bytes:0, staged:StagedImages::default(), encodes:0, hits:0 };
         finish_uploads()?;
         Ok(vision)
     }
@@ -161,33 +184,116 @@ impl Vision {
         Ok(())
     }
     pub fn stage(&mut self, k: &Kernels, stream: &Stream, images: &[Image], tokens: &[i32], from: usize) -> Result<()> {
-        if images.is_empty() && self.span_count == 0 { return Ok(()); }
-        stream.synchronize()?;
-        self.active.clear(); self.spans = None; self.span_count = images.len();
-        let mut spans = Vec::new(); let mut end = 0;
-        for im in images {
-            im.validate(tokens)?;
-            ensure!(im.start >= end, "overlapping/out-of-order image spans"); end = im.end();
-            spans.extend([im.start as i32, im.end() as i32]);
-            if im.end() > from.min(tokens.len().saturating_sub(128)) {
-                let rows = self.encode(k, stream, im)?;
-                self.active.push((im.start, im.end(), rows));
-            }
+        if images.is_empty() && self.staged.span_count == 0 {
+            return Ok(());
         }
-        if !spans.is_empty() { self.spans = Some(Buffer::from_host(&spans)?); finish_uploads()?; }
+        // The incumbent path replaces a stage in place, so finish any users of its spans.
+        stream.synchronize()?;
+        self.staged = StagedImages::default();
+        let mut staged = Self::begin_staging(images, tokens, from, 128)?;
+        while !self.stage_next(k, stream, &mut staged)? {}
+        self.staged = staged;
         Ok(())
     }
-    pub fn spans_ptr(&self) -> DevPtr { self.spans.as_ref().map_or(0, |b| b.ptr) }
+
+    pub(crate) fn begin_staging(
+        images: &[Image],
+        tokens: &[i32],
+        from: usize,
+        replay_window: usize,
+    ) -> Result<StagedImages> {
+        if images.is_empty() {
+            return Ok(StagedImages::default());
+        }
+        let spans = image_spans(images, tokens).context(InvalidImageStaging)?;
+        let needed = required_images(images, tokens.len(), from, replay_window);
+        let staged = StagedImages {
+            active: Vec::new(),
+            spans: Some(Buffer::from_host(&spans)?),
+            span_count: images.len(),
+            pending: needed.iter().cloned().collect(),
+        };
+        finish_uploads()?;
+        Ok(staged)
+    }
+
+    pub(crate) fn stage_next(&mut self, k: &Kernels, stream: &Stream, staged: &mut StagedImages) -> Result<bool> {
+        if let Some(image) = staged.pending.front() {
+            let rows = self.encode(k, stream, image)?;
+            staged.active.push((image.start, image.end(), rows));
+            staged.pending.pop_front();
+        }
+        Ok(staged.is_complete())
+    }
+
+    pub(crate) fn swap_staged(&mut self, staged: &mut StagedImages) {
+        std::mem::swap(&mut self.staged, staged);
+    }
+
+    pub fn spans_ptr(&self) -> DevPtr { self.staged.spans.as_ref().map_or(0, |b| b.ptr) }
+    pub fn span_count(&self) -> usize { self.staged.span_count }
+
     pub fn overlaps(&self, pos: usize, n: usize) -> bool {
-        self.active.iter().any(|&(s,e,_)| s < pos+n && e > pos)
+        self.staged.active.iter().any(|&(start, end, _)| span_overlap(start, end, pos, n).is_some())
     }
     pub fn embed(&self, k: &Kernels, stream: &Stream, h: DevPtr, cmp_hist: DevPtr, pos: usize, n: usize, hc: usize) -> Result<()> {
-        for (start,end,rows) in &self.active {
-            let lo = pos.max(*start); let hi = (pos+n).min(*end);
-            if lo < hi { Self::kernel(k, stream, "vision_embed", ((hi-lo)*self.dim*hc).div_ceil(256), Args::new()
-                .ptr(rows.ptr + ((lo-start)*self.dim*2) as u64).ptr(h + ((lo-pos)*self.dim*hc*2) as u64)
-                .ptr(if cmp_hist == 0 { 0 } else { cmp_hist + (lo*4) as u64 }).i32((hi-lo) as i32).i32(self.dim as i32).i32(hc as i32))?; }
+        for &(start, end, ref rows) in &self.staged.active {
+            if let Some(overlap) = span_overlap(start, end, pos, n) {
+                Self::kernel(k, stream, "vision_embed", (overlap.len() * self.dim * hc).div_ceil(256), Args::new()
+                    .ptr(rows.ptr + ((overlap.start - start) * self.dim * 2) as u64)
+                    .ptr(h + ((overlap.start - pos) * self.dim * hc * 2) as u64)
+                    .ptr(if cmp_hist == 0 { 0 } else { cmp_hist + (overlap.start * 4) as u64 })
+                    .i32(overlap.len() as i32).i32(self.dim as i32).i32(hc as i32))?;
+            }
         }
         Ok(())
+    }
+}
+
+fn image_spans(images: &[Image], tokens: &[i32]) -> Result<Vec<i32>> {
+    let mut spans = Vec::with_capacity(images.len() * 2);
+    let mut end = 0;
+    for image in images {
+        image.validate(tokens)?;
+        ensure!(image.start >= end, "overlapping/out-of-order image spans");
+        end = image.end();
+        spans.extend([i32::try_from(image.start)?, i32::try_from(end)?]);
+    }
+    Ok(spans)
+}
+
+fn required_images(images: &[Image], prompt_len: usize, from: usize, replay_window: usize) -> &[Image] {
+    let first_needed = from.min(prompt_len.saturating_sub(replay_window));
+    &images[images.partition_point(|image| image.end() <= first_needed)..]
+}
+
+fn span_overlap(start: usize, end: usize, pos: usize, rows: usize) -> Option<std::ops::Range<usize>> {
+    let lo = pos.max(start);
+    let hi = pos.saturating_add(rows).min(end);
+    (lo < hi).then_some(lo..hi)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Image, required_images, span_overlap};
+
+    #[test]
+    fn image_spans_can_cross_prefill_and_replay_boundaries() {
+        let span = 126..132;
+        let overlaps: Vec<_> = [(120, 4), (124, 4), (128, 3), (131, 3), (134, 1)]
+            .into_iter()
+            .filter_map(|(pos, rows)| span_overlap(span.start, span.end, pos, rows))
+            .collect();
+        assert_eq!(overlaps, [126..128, 128..131, 131..132]);
+        assert_eq!(overlaps.into_iter().flatten().collect::<Vec<_>>(), span.collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn image_staging_skips_only_spans_entirely_before_prefill_and_replay() {
+        let image = |start| Image { start, height: 3, width: 3, digest: [0; 32], patches: [].into() };
+        let images = [image(0), image(125), image(200)];
+        assert_eq!(required_images(&images, 256, 220, 128).iter().map(|image| image.start).collect::<Vec<_>>(), [125, 200]);
+        assert_eq!(required_images(&images, 256, 2, 128).len(), 3);
+        assert!(required_images(&images, 512, 256, 128).is_empty());
     }
 }
