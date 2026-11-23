@@ -1,7 +1,7 @@
 use crate::ops::{self, Epilogue, GemvOpts, Moe, RopeParams, WFmt, Weight};
 use crate::sampling::{SampIo, SampParams};
 use crate::weights::{Arena, Layer, Weights};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use deepseek_ultrafast_cuda::{self as cu, Args, DevPtr, Launch, Stream};
 use deepseek_ultrafast_kernels::Kernels;
 use deepseek_ultrafast_model::config::{Config, rope_table};
@@ -598,6 +598,8 @@ pub struct Rank {
     packed_rows: DevPtr,
     packed_target_rows: usize,
     packed_graphs_enabled: bool,
+    batch_probe_sync: bool,
+    batch_probe_layer_sync: bool,
     packed_graphs: std::collections::HashMap<(usize, bool), Option<cu::GraphExec>>,
     packed_spec: Option<batch_speculation::Workspace>,
     mk_kmax: DevPtr,
@@ -759,6 +761,9 @@ impl Rank {
                 _ => anyhow::bail!("DSUF_PACKED_GRAPHS must be 0 or 1"),
             }
         } else { false };
+        let batch_probe_sync = matches!(std::env::var("DSUF_BATCH_PROBE_SYNC").as_deref(), Ok("1"));
+        let batch_probe_layer_sync = batch_probe_sync
+            && matches!(std::env::var("DSUF_BATCH_PROBE_LAYER_SYNC").as_deref(), Ok("1"));
         let (plo, phi) = Stream::priority_range()?;
         let (pmain, pside, ppar) = match deepseek_ultrafast_cuda::profile::profile() {
             deepseek_ultrafast_cuda::profile::Profile::Sm103Tp4 => (-4, -4, -5),
@@ -1142,6 +1147,8 @@ impl Rank {
             packed_rows,
             packed_target_rows: if packed { 8 } else { 0 },
             packed_graphs_enabled,
+            batch_probe_sync,
+            batch_probe_layer_sync,
             packed_graphs: Default::default(),
             packed_spec: None,
             mk_kmax,
@@ -2351,6 +2358,36 @@ impl Rank {
         [(self.tail.h, self.cfg.window_size * 4 * self.cfg.dim * 2), (self.tail.pre, self.cfg.window_size * 4 * 4)]
     }
 
+    fn batch_probe_fence(&self, phase: &str, layer: Option<usize>) -> Result<()> {
+        self.batch_probe_fence_with(phase, layer, || self.synchronize_packed_compute())
+    }
+
+    fn batch_probe_compression_fence(&self, phase: &str, layer: usize) -> Result<()> {
+        if !self.batch_probe_layer_sync || layer != 2 {
+            return Ok(());
+        }
+        // Fence the active stream where the substage was enqueued. Joining the
+        // other streams here could wait on work this rank has yet to submit.
+        self.batch_probe_fence_with(phase, Some(layer), || self.st().synchronize())
+    }
+
+    fn batch_probe_fence_with(&self, phase: &str, layer: Option<usize>, fence: impl FnOnce() -> Result<()>) -> Result<()> {
+        if !self.batch_probe_sync {
+            return Ok(());
+        }
+        let pos = self.host_pos_end;
+        let rows = self.cur_m;
+        if self.rank == 0 {
+            eprintln!("kiln_packed_probe_fence phase={phase} layer={layer:?} end={pos} rows={rows} status=started");
+        }
+        fence()
+            .with_context(|| format!("packed probe rank {} fence after {phase}, layer {layer:?}, end {pos}, rows {rows}", self.rank))?;
+        if self.rank == 0 {
+            eprintln!("kiln_packed_probe_fence phase={phase} layer={layer:?} end={pos} rows={rows} status=passed");
+        }
+        Ok(())
+    }
+
     fn replay_decoder(&mut self, toks: &[i32]) -> Result<i32> {
         let c = self.cfg.clone();
         let n = toks.len();
@@ -2382,12 +2419,14 @@ impl Rank {
         let r = self.forward_impl(m, dec0, c.n_layers, false, true, None, None);
         self.win_floor.set(0);
         self.swa_replay.set(false);
-        r?;
+        r.context("enqueue decoder replay and head")?;
+        self.batch_probe_fence("decoder_replay_and_head", None)?;
         if m > MAX_M {
-            self.dspark_prep_tail(m, 0)?;
+            self.dspark_prep_tail(m, 0).context("enqueue draft KV preparation")?;
         } else {
-            self.dspark_prep(m)?;
+            self.dspark_prep(m).context("enqueue draft KV preparation")?;
         }
+        self.batch_probe_fence("draft_kv_prep", None)?;
         let next = self.read_next(m)?;
         Ok(next[m - 1])
     }
@@ -2487,9 +2526,13 @@ impl Rank {
                 meta.tokens[..m].copy_from_slice(tokens);
                 rk.set_meta(&meta)?;
             }
-            rk.forward_impl(m, 0, progress.decoder_start, true, false, None, None)?;
-            rk.stream_kv_source(progress.decoder_start, m)?;
-            rk.stash_tail(m)
+            rk.forward_impl(m, 0, progress.decoder_start, true, false, None, None)
+                .context("enqueue encoder prefill")?;
+            rk.batch_probe_fence("encoder_prefill", None)?;
+            rk.stream_kv_source(progress.decoder_start, m).context("enqueue encoder KV source")?;
+            rk.batch_probe_fence("encoder_kv_source", Some(progress.decoder_start))?;
+            rk.stash_tail(m).context("enqueue encoder tail copy")?;
+            rk.batch_probe_fence("encoder_stash_tail", None)
         })?;
         progress.pos += m;
         self.end_prefill();
@@ -2751,13 +2794,17 @@ impl Rank {
             } else {
                 if let Err(error) = self.layer_with_window_scratch(l, m, read) {
                     if !readonly { self.caches[l].truncate(0); }
-                    return Err(error);
+                    return Err(error.context(format!("enqueue packed forward layer {l}")));
                 }
                 if !readonly { self.caches[l].record_window(start, self.host_pos_end); }
                 if history_write { self.caches[l].record_history(start, self.host_pos_end); }
             }
             if l + 1 == hi && self.cand_pending.replace(false) {
                 self.par_join()?;
+            }
+            if self.batch_probe_layer_sync {
+                let phase = if self.swa_replay.get() { "replay_layer" } else { "forward_layer" };
+                self.batch_probe_fence(phase, Some(l))?;
             }
             if let Some(t) = trace.as_deref_mut() {
                 t.push(self.read_h(m)?);
@@ -2911,6 +2958,7 @@ impl Rank {
     fn layer(&mut self, l: usize, m: usize) -> Result<()> {
         self.attention_layer(l, m, true)?;
         self.attention_output(l, m)?;
+        self.batch_probe_compression_fence("compression_attention_output", l)?;
         self.ffn_layer(l, m)
     }
 
@@ -3043,6 +3091,7 @@ impl Rank {
             if par {
                 self.par_join()?;
             }
+            self.batch_probe_compression_fence("compression_joined", l)?;
             if let Some(ix) = &ly.indexer {
                 let ihd = c.index_head_dim;
                 let inh = c.index_n_heads;
@@ -3157,6 +3206,7 @@ impl Rank {
                         let gx = ((tmax as u32).div_ceil(128)).min((2 * self.sms / m as u32).max(1));
                         self.launch("idx_score", grid(gx, m as u32, 128), Args::new().ptr(self.meta).push(ip))?;
                     }
+                    self.batch_probe_compression_fence("compression_index_score", l)?;
                     let (r0, rows, smeta) = shard.map(|s| (s.0, s.1 - s.0, s.2)).unwrap_or((0, m, self.meta));
                     let cand_par = is_cand_src && m <= MAX_M && shard.is_none();
                     if cand_par {
@@ -3235,6 +3285,7 @@ impl Rank {
         if ratio == 0 && par {
             self.par_join()?;
         }
+        self.batch_probe_compression_fence("compression_index_topk", l)?;
         let comp = if ratio > 0 { self.caches[c.kv_source_of(l).unwrap()].comp.unwrap() } else { 0 };
         {
             let (sp, r) = if ktop > 0 { (16u32, 48usize) } else { (8u32, 16usize) };
@@ -3279,6 +3330,7 @@ impl Rank {
                 self.launch(af, cfg, Args::new().ptr(self.meta).push(p))?;
             }
         }
+        self.batch_probe_compression_fence("compression_attention", l)?;
         self.hc_late_fork()
     }
 
@@ -3675,11 +3727,18 @@ impl Rank {
                             )?;
                         }
                     }
-                    self.launch(
-                        "compress_pool",
-                        Launch::new(m as u32, 128),
-                        Args::new().ptr(self.meta).ptr(kvh).ptr(sch).i32(ratio as i32).ptr(cp.norm).f32(c.norm_eps).ptr(self.b.latent).i32(hd as i32).i32(ring_rows),
-                    )?;
+                    self.batch_probe_compression_fence("compression_history", l)?;
+                    let mut args = Args::new();
+                    args.ptr(self.meta).ptr(kvh).ptr(sch).i32(ratio as i32).ptr(cp.norm)
+                        .f32(c.norm_eps).ptr(self.b.latent).i32(hd as i32);
+                    let kernel = if ring_rows == 0 {
+                        "compress_pool"
+                    } else {
+                        args.i32(ring_rows);
+                        "compress_pool_ring"
+                    };
+                    self.launch(kernel, Launch::new(m as u32, 128), &mut args)?;
+                    self.batch_probe_compression_fence("compression_pool", l)?;
                 } else {
                     self.gemv(&cp.wkv, x, dim, m, self.b.latent, hd, xa)?;
                 }
@@ -3689,6 +3748,7 @@ impl Rank {
                 let ihd = c.index_head_dim;
                 let pre = if ratio > 1 { None } else { Some((cp.norm, c.norm_eps)) };
                 self.gemv(wk, self.b.latent, hd, m, self.b.ik, ihd, GemvOpts { prenorm: pre, ..Default::default() })?;
+                self.batch_probe_compression_fence("compression_index_keys", l)?;
                 let (k4, ks) = cache.idx_k4.unwrap();
                 let pk = RopeParams { q4: k4, sf4: ks, ..self.rope_params(self.b.ik, ihd, ihd, 1, table, false, Q_FP4_E8M0, ratio, cache.idx_k.unwrap(), ix.k_norm) };
                 let pc = self.rope_params(self.b.latent, hd, hd, 1, table, false, Q_FP4_E4M3_16, ratio, cache.comp.unwrap(), lnorm);
@@ -3698,10 +3758,12 @@ impl Rank {
                     self.rope_launch(pk, m)?;
                     self.rope_launch(pc, m)?;
                 }
+                self.batch_probe_compression_fence("compression_rope", l)?;
             }
         }
         if ly.indexer.is_some() && !self.wproj_main(ly, m) {
             self.idx_weights(ly, m)?;
+            self.batch_probe_compression_fence("compression_side_weights", l)?;
         }
         Ok(())
     }
