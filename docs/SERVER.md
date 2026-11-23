@@ -101,3 +101,39 @@ native `reasoning.effort`; otherwise the aliases map to `high`/`none`. Both alia
 containers are applied consistently across APIs so changed controls select the
 intended rendered history. Raw `/v1/completions` does not apply a chat template:
 its caller-supplied prompt/control tokens remain unchanged.
+
+## Screening a concurrent decode design
+
+The serving worker currently executes one request across its TP ranks at a
+time. Before changing that GPU path, use `tools/concurrency_probe.py` with the
+**exact** checkpoint's `inference/config.json` and a bounded worker-evidence
+JSONL file containing `request_end` events:
+
+```sh
+python3 tools/concurrency_probe.py \
+  --config /path/to/inference/config.json \
+  --trace /path/to/worker-evidence.jsonl \
+  --max-seq 65536 --active 1,2,4,8,16 \
+  --draft-tokens 3 --max-verify-rows 8 \
+  --accepted-tokens-per-step 1 --first-useful-ms 2000 \
+  --minimum-visible-tps 80 > concurrency-resources.json
+```
+
+This CPU-only probe reports a **resource and demand screen**, never a predicted
+GPU throughput. It calculates the explicit per-rank KV/history arrays allocated
+in `model.rs`, verification-row packing, the batch-step time that would be
+needed for the chosen per-stream speed floor, and prefill demand under both
+all-cold and saved-cache assumptions. Its right-sized multi-request KV number is a
+**copy-per-session scenario**, not a universal memory lower bound: a future
+shared-prefix or paged layout could differ. The running `Rank` owns one
+`--max-seq` allocation, and a real
+concurrent implementation needs per-request state, batch-aware kernels, and
+live parity and performance tests. The memory number excludes weights, graph,
+scratch, rope tables, and other allocations. Eight verification rows is the
+conservative existing decode-kernel limit; sixteen is the graph's hard cap,
+and using more than eight needs separate GPU qualification. The probe reads
+request identities but emits no identities; `single_worker_identity_bound`
+identifies whether the input carried a consistent worker identity header.
+
+Run its focused offline checks with
+`python3 -m unittest discover -s tools -p 'test_concurrency_probe.py'`.
