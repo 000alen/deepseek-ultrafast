@@ -1,5 +1,7 @@
 # Deployment
 
+For the 500-user coding event, see [Hackathon serving](../docs/HACKATHON.md) for the Inkling and Ornith backends, workload sizing, and qualification commands.
+
 ## Build the image
 
 ```sh
